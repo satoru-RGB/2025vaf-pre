@@ -1,1 +1,1548 @@
+"""
+Picture Book Reader Web Application
+-----------------------------------
+
+This is a web-based application for reading and managing picture books in PDF format. 
+Features include user authentication, book management, reading progress tracking, and bookmarks.
+
+Project Structure:
+- app/ - Main application directory
+  - models.py - Database models
+  - routes.py - Web routes and controllers
+  - utils.py - Utility functions
+  - templates/ - HTML templates
+  - static/ - Static assets (CSS, JS)
+- config.py - Configuration settings
+- run.py - Application entry point
+"""
+
+# run.py - Application entry point
+from app import create_app
+
+app = create_app()
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
+# config.py - Configuration settings
+import os
+from datetime import timedelta
+
+class Config:
+    SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-secret-key'
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///picture_book_reader.db'
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app', 'static', 'uploads')
+    MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB max upload
+    PDF_FOLDER = os.path.join(UPLOAD_FOLDER, 'pdf')
+    COVER_FOLDER = os.path.join(UPLOAD_FOLDER, 'covers')
+    THUMBNAIL_SIZE = (400, 600)
+    PERMANENT_SESSION_LIFETIME = timedelta(days=7)
+
+# app/__init__.py - Application factory
+import os
+from flask import Flask
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager
+from flask_migrate import Migrate
+from config import Config
+
+db = SQLAlchemy()
+migrate = Migrate()
+login_manager = LoginManager()
+login_manager.login_view = 'auth.login'
+login_manager.login_message = 'このページにアクセスするにはログインが必要です。'
+login_manager.login_message_category = 'info'
+
+def create_app(config_class=Config):
+    app = Flask(__name__)
+    app.config.from_object(config_class)
+
+    # Ensure upload directories exist
+    os.makedirs(app.config['PDF_FOLDER'], exist_ok=True)
+    os.makedirs(app.config['COVER_FOLDER'], exist_ok=True)
+
+    db.init_app(app)
+    migrate.init_app(app, db)
+    login_manager.init_app(app)
+
+    from app.main import bp as main_bp
+    app.register_blueprint(main_bp)
+    
+    from app.auth import bp as auth_bp
+    app.register_blueprint(auth_bp, url_prefix='/auth')
+    
+    from app.admin import bp as admin_bp
+    app.register_blueprint(admin_bp, url_prefix='/admin')
+    
+    return app
+
+# app/models.py - Database models
+from app import db, login_manager
+from flask_login import UserMixin
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime
+import uuid
+
+@login_manager.user_loader
+def load_user(id):
+    return User.query.get(id)
+
+class User(UserMixin, db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    username = db.Column(db.String(64), index=True, unique=True)
+    password_hash = db.Column(db.String(128))
+    is_admin = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def __repr__(self):
+        return f'<User {self.username}>'
+    
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+    
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+class BookTag(db.Model):
+    book_id = db.Column(db.String(36), db.ForeignKey('book.id'), primary_key=True)
+    tag = db.Column(db.String(50), primary_key=True)
+
+class Bookmark(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    book_id = db.Column(db.String(36), db.ForeignKey('book.id'))
+    page = db.Column(db.Integer)
+    note = db.Column(db.String(200))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    book = db.relationship('Book', back_populates='bookmarks')
+
+class Book(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    title = db.Column(db.String(100), nullable=False)
+    cover_path = db.Column(db.String(255), nullable=False)
+    pdf_path = db.Column(db.String(255), nullable=False)
+    last_read_page = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    bookmarks = db.relationship('Bookmark', back_populates='book', cascade='all, delete-orphan')
+    
+    @property
+    def tags(self):
+        return [bt.tag for bt in BookTag.query.filter_by(book_id=self.id).all()]
+    
+    def add_tag(self, tag):
+        if tag not in self.tags:
+            book_tag = BookTag(book_id=self.id, tag=tag)
+            db.session.add(book_tag)
+    
+    def remove_tag(self, tag):
+        BookTag.query.filter_by(book_id=self.id, tag=tag).delete()
+    
+    def add_bookmark(self, page, note=''):
+        bookmark = Bookmark(book_id=self.id, page=page, note=note)
+        db.session.add(bookmark)
+        return bookmark
+    
+    def get_bookmark(self, page):
+        return Bookmark.query.filter_by(book_id=self.id, page=page).first()
+    
+    def remove_bookmark(self, page):
+        Bookmark.query.filter_by(book_id=self.id, page=page).delete()
+
+# app/auth/__init__.py - Auth blueprint
+from flask import Blueprint
+
+bp = Blueprint('auth', __name__)
+
+from app.auth import routes
+
+# app/auth/routes.py - Authentication routes
+from flask import render_template, flash, redirect, url_for, request
+from flask_login import login_user, logout_user, current_user
+from app import db
+from app.auth import bp
+from app.models import User
+from app.auth.forms import LoginForm, RegistrationForm
+
+@bp.route('/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('main.index'))
+    
+    form = LoginForm()
+    if form.validate_on_submit():
+        user = User.query.filter_by(username=form.username.data).first()
+        if user is None or not user.check_password(form.password.data):
+            flash('ユーザー名またはパスワードが間違っています', 'danger')
+            return redirect(url_for('auth.login'))
+        
+        login_user(user, remember=form.remember_me.data)
+        next_page = request.args.get('next')
+        if not next_page or not next_page.startswith('/'):
+            next_page = url_for('main.index')
+        return redirect(next_page)
+    
+    return render_template('auth/login.html', title='ログイン', form=form)
+
+@bp.route('/logout')
+def logout():
+    logout_user()
+    return redirect(url_for('main.index'))
+
+@bp.route('/register', methods=['GET', 'POST'])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for('main.index'))
+    
+    form = RegistrationForm()
+    if form.validate_on_submit():
+        user = User(username=form.username.data)
+        user.set_password(form.password.data)
+        db.session.add(user)
+        db.session.commit()
+        flash('アカウントの登録が完了しました！', 'success')
+        return redirect(url_for('auth.login'))
+    
+    return render_template('auth/register.html', title='新規登録', form=form)
+
+# app/auth/forms.py - Authentication forms
+from flask_wtf import FlaskForm
+from wtforms import StringField, PasswordField, BooleanField, SubmitField
+from wtforms.validators import DataRequired, Length, EqualTo, ValidationError
+from app.models import User
+
+class LoginForm(FlaskForm):
+    username = StringField('ユーザー名', validators=[DataRequired()])
+    password = PasswordField('パスワード', validators=[DataRequired()])
+    remember_me = BooleanField('ログイン状態を保持')
+    submit = SubmitField('ログイン')
+
+class RegistrationForm(FlaskForm):
+    username = StringField('ユーザー名', validators=[DataRequired(), Length(min=3, max=20)])
+    password = PasswordField('パスワード', validators=[DataRequired(), Length(min=6)])
+    password2 = PasswordField(
+        'パスワード（確認用）', validators=[DataRequired(), EqualTo('password')])
+    submit = SubmitField('登録')
+    
+    def validate_username(self, username):
+        user = User.query.filter_by(username=username.data).first()
+        if user is not None:
+            raise ValidationError('このユーザー名は既に使用されています。別のユーザー名を選択してください。')
+
+# app/main/__init__.py - Main blueprint
+from flask import Blueprint
+
+bp = Blueprint('main', __name__)
+
+from app.main import routes
+
+# app/main/routes.py - Main routes
+from flask import render_template, flash, redirect, url_for, request, current_app, jsonify
+from flask_login import login_required, current_user
+from app import db
+from app.main import bp
+from app.models import Book, Bookmark
+from app.main.forms import SearchForm
+
+@bp.route('/')
+@bp.route('/index')
+@login_required
+def index():
+    search_form = SearchForm()
+    selected_tag = request.args.get('tag')
+    search_query = request.args.get('query', '')
+    
+    # Get all available tags
+    tags = db.session.query(BookTag.tag).distinct().all()
+    all_tags = [tag[0] for tag in tags]
+    
+    # Filter books by search query and tag
+    books = Book.query
+    if search_query:
+        books = books.filter(Book.title.contains(search_query))
+    
+    if selected_tag:
+        book_ids = [bt.book_id for bt in BookTag.query.filter_by(tag=selected_tag).all()]
+        books = books.filter(Book.id.in_(book_ids))
+    
+    books = books.all()
+    
+    return render_template('main/index.html', 
+                          title='マイ絵本ライブラリ',
+                          books=books, 
+                          search_form=search_form,
+                          all_tags=all_tags,
+                          selected_tag=selected_tag,
+                          search_query=search_query)
+
+@bp.route('/book/<string:id>')
+@login_required
+def book_detail(id):
+    book = Book.query.get_or_404(id)
+    return render_template('main/book_detail.html', title=book.title, book=book)
+
+@bp.route('/book/<string:id>/read')
+@login_required
+def read_book(id):
+    book = Book.query.get_or_404(id)
+    return render_template('main/read_book.html', title=f'読む: {book.title}', book=book)
+
+@bp.route('/api/book/<string:id>/last-page', methods=['POST'])
+@login_required
+def update_last_page(id):
+    book = Book.query.get_or_404(id)
+    page = request.json.get('page', 0)
+    book.last_read_page = page
+    db.session.commit()
+    return jsonify({'success': True})
+
+@bp.route('/api/book/<string:id>/bookmark', methods=['POST', 'DELETE'])
+@login_required
+def manage_bookmark(id):
+    book = Book.query.get_or_404(id)
+    
+    if request.method == 'POST':
+        page = request.json.get('page', 0)
+        note = request.json.get('note', '')
+        
+        # Check if bookmark already exists
+        existing = book.get_bookmark(page)
+        if existing:
+            existing.note = note
+        else:
+            book.add_bookmark(page, note)
+        
+        db.session.commit()
+        return jsonify({'success': True})
+    
+    elif request.method == 'DELETE':
+        page = request.json.get('page', 0)
+        book.remove_bookmark(page)
+        db.session.commit()
+        return jsonify({'success': True})
+
+@bp.route('/api/book/<string:id>/bookmarks')
+@login_required
+def get_bookmarks(id):
+    book = Book.query.get_or_404(id)
+    bookmarks = [{'page': b.page, 'note': b.note} for b in book.bookmarks]
+    return jsonify(bookmarks)
+
+# app/main/forms.py - Main forms
+from flask_wtf import FlaskForm
+from wtforms import StringField, SubmitField
+from wtforms.validators import DataRequired
+
+class SearchForm(FlaskForm):
+    query = StringField('検索', validators=[DataRequired()])
+    submit = SubmitField('検索')
+
+# app/admin/__init__.py - Admin blueprint
+from flask import Blueprint
+
+bp = Blueprint('admin', __name__)
+
+from app.admin import routes
+
+# app/admin/routes.py - Admin routes
+from flask import render_template, flash, redirect, url_for, request, current_app
+from flask_login import login_required, current_user
+from app import db
+from app.admin import bp
+from app.models import User, Book, BookTag
+from app.admin.forms import AddUserForm, AddBookForm
+from app.utils import save_pdf, save_cover, generate_thumbnail
+import os
+
+def admin_required(f):
+    @login_required
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_admin:
+            flash('管理者権限が必要です', 'danger')
+            return redirect(url_for('main.index'))
+        return f(*args, **kwargs)
+    decorated_function.__name__ = f.__name__
+    return decorated_function
+
+@bp.route('/')
+@admin_required
+def index():
+    return render_template('admin/index.html', title='管理パネル')
+
+@bp.route('/users')
+@admin_required
+def users():
+    users = User.query.all()
+    return render_template('admin/users.html', title='ユーザー管理', users=users)
+
+@bp.route('/users/add', methods=['GET', 'POST'])
+@admin_required
+def add_user():
+    form = AddUserForm()
+    if form.validate_on_submit():
+        user = User(username=form.username.data, is_admin=form.is_admin.data)
+        user.set_password(form.password.data)
+        db.session.add(user)
+        db.session.commit()
+        flash(f'ユーザー「{form.username.data}」を追加しました', 'success')
+        return redirect(url_for('admin.users'))
+    return render_template('admin/add_user.html', title='ユーザー追加', form=form)
+
+@bp.route('/users/<string:id>/delete', methods=['POST'])
+@admin_required
+def delete_user(id):
+    user = User.query.get_or_404(id)
+    if user.id == current_user.id:
+        flash('自分自身を削除することはできません', 'danger')
+    else:
+        db.session.delete(user)
+        db.session.commit()
+        flash(f'ユーザー「{user.username}」を削除しました', 'success')
+    return redirect(url_for('admin.users'))
+
+@bp.route('/books')
+@admin_required
+def books():
+    books = Book.query.all()
+    return render_template('admin/books.html', title='絵本管理', books=books)
+
+@bp.route('/books/add', methods=['GET', 'POST'])
+@admin_required
+def add_book():
+    form = AddBookForm()
+    if form.validate_on_submit():
+        # Save PDF file
+        pdf_filename = save_pdf(form.pdf_file.data)
+        pdf_path = os.path.join('uploads', 'pdf', pdf_filename)
+        
+        # Handle cover image
+        if form.cover_file.data:
+            cover_filename = save_cover(form.cover_file.data)
+        else:
+            # Generate cover from PDF
+            cover_filename = generate_thumbnail(pdf_filename)
+        
+        cover_path = os.path.join('uploads', 'covers', cover_filename)
+        
+        # Create book
+        book = Book(
+            title=form.title.data,
+            cover_path=cover_path,
+            pdf_path=pdf_path
+        )
+        
+        # Add tags
+        tags = [tag.strip() for tag in form.tags.data.split(',') if tag.strip()]
+        
+        db.session.add(book)
+        db.session.flush()  # To get book.id
+        
+        for tag in tags:
+            book.add_tag(tag)
+        
+        db.session.commit()
+        flash(f'絵本「{form.title.data}」を追加しました', 'success')
+        return redirect(url_for('admin.books'))
+    
+    return render_template('admin/add_book.html', title='絵本追加', form=form)
+
+@bp.route('/books/<string:id>/delete', methods=['POST'])
+@admin_required
+def delete_book(id):
+    book = Book.query.get_or_404(id)
+    
+    # Delete files from disk
+    try:
+        if os.path.exists(os.path.join(current_app.root_path, 'static', book.pdf_path)):
+            os.remove(os.path.join(current_app.root_path, 'static', book.pdf_path))
+        
+        if os.path.exists(os.path.join(current_app.root_path, 'static', book.cover_path)):
+            os.remove(os.path.join(current_app.root_path, 'static', book.cover_path))
+    except Exception as e:
+        flash(f'ファイル削除中にエラーが発生しました: {str(e)}', 'warning')
+    
+    # Delete from database
+    db.session.delete(book)
+    db.session.commit()
+    
+    flash(f'絵本「{book.title}」を削除しました', 'success')
+    return redirect(url_for('admin.books'))
+
+# app/admin/forms.py - Admin forms
+from flask_wtf import FlaskForm
+from flask_wtf.file import FileField, FileRequired, FileAllowed
+from wtforms import StringField, PasswordField, BooleanField, SubmitField
+from wtforms.validators import DataRequired, Length, EqualTo, ValidationError
+from app.models import User
+
+class AddUserForm(FlaskForm):
+    username = StringField('ユーザー名', validators=[DataRequired(), Length(min=3, max=20)])
+    password = PasswordField('パスワード', validators=[DataRequired(), Length(min=6)])
+    password2 = PasswordField(
+        'パスワード（確認用）', validators=[DataRequired(), EqualTo('password')])
+    is_admin = BooleanField('管理者権限')
+    submit = SubmitField('追加')
+    
+    def validate_username(self, username):
+        user = User.query.filter_by(username=username.data).first()
+        if user is not None:
+            raise ValidationError('このユーザー名は既に使用されています。別のユーザー名を選択してください。')
+
+class AddBookForm(FlaskForm):
+    title = StringField('タイトル', validators=[DataRequired(), Length(max=100)])
+    tags = StringField('タグ（カンマ区切り）')
+    pdf_file = FileField('PDFファイル', validators=[
+        FileRequired(),
+        FileAllowed(['pdf'], 'PDFファイルのみアップロード可能です')
+    ])
+    cover_file = FileField('カバー画像（任意）', validators=[
+        FileAllowed(['jpg', 'jpeg', 'png'], '画像ファイルのみアップロード可能です')
+    ])
+    submit = SubmitField('追加')
+
+# app/utils.py - Utility functions
+import os
+import uuid
+from flask import current_app
+from werkzeug.utils import secure_filename
+import fitz  # PyMuPDF
+from PIL import Image
+from io import BytesIO
+
+def save_pdf(pdf_file):
+    """Save PDF file with unique filename"""
+    filename = f"{uuid.uuid4().hex}.pdf"
+    pdf_file.save(os.path.join(current_app.config['PDF_FOLDER'], filename))
+    return filename
+
+def save_cover(cover_file):
+    """Save cover image with unique filename"""
+    extension = cover_file.filename.rsplit('.', 1)[1].lower()
+    filename = f"{uuid.uuid4().hex}.{extension}"
+    cover_file.save(os.path.join(current_app.config['COVER_FOLDER'], filename))
+    return filename
+
+def generate_thumbnail(pdf_filename):
+    """Generate thumbnail from first page of PDF"""
+    pdf_path = os.path.join(current_app.config['PDF_FOLDER'], pdf_filename)
+    thumbnail_filename = f"{pdf_filename.rsplit('.', 1)[0]}_cover.jpg"
+    thumbnail_path = os.path.join(current_app.config['COVER_FOLDER'], thumbnail_filename)
+    
+    # Open PDF and get first page
+    pdf = fitz.open(pdf_path)
+    first_page = pdf[0]
+    
+    # Render page to image
+    pix = first_page.get_pixmap()
+    img_data = pix.tobytes("jpeg")
+    
+    # Resize image
+    img = Image.open(BytesIO(img_data))
+    img.thumbnail(current_app.config['THUMBNAIL_SIZE'])
+    
+    # Save thumbnail
+    img.save(thumbnail_path, "JPEG")
+    
+    return thumbnail_filename
+
+def seed_admin():
+    """Create admin user if one doesn't exist"""
+    from app.models import User
+    from app import db
+    
+    admin = User.query.filter_by(is_admin=True).first()
+    if admin is None:
+        admin = User(username='admin', is_admin=True)
+        admin.set_password('admin123')
+        db.session.add(admin)
+        db.session.commit()
+        print("Admin user created: username='admin', password='admin123'")
+
+def seed_sample_books():
+    """Add sample books if none exist"""
+    from app.models import Book
+    from app import db
+    
+    if Book.query.count() == 0:
+        # Add sample books
+        # This would require sample PDF files to be in place
+        pass
+
+# Create templates directory structure and HTML templates
+"""
+app/templates/
+  └── base.html
+  ├── auth/
+  │   ├── login.html
+  │   └── register.html
+  ├── main/
+  │   ├── index.html 
+  │   ├── book_detail.html
+  │   └── read_book.html
+  └── admin/
+      ├── index.html
+      ├── users.html
+      ├── add_user.html
+      ├── books.html
+      └── add_book.html
+"""
+
+# app/templates/base.html
+"""
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% if title %}{{ title }} - {% endif %}絵本リーダー</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    {% block styles %}{% endblock %}
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+        <div class="container">
+            <a class="navbar-brand" href="{{ url_for('main.index') }}">絵本リーダー</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav me-auto">
+                    {% if current_user.is_authenticated %}
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('main.index') }}">ライブラリ</a>
+                    </li>
+                    {% if current_user.is_admin %}
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('admin.index') }}">管理</a>
+                    </li>
+                    {% endif %}
+                    {% endif %}
+                </ul>
+                <ul class="navbar-nav">
+                    {% if current_user.is_authenticated %}
+                    <li class="nav-item dropdown">
+                        <a class="nav-link dropdown-toggle" href="#" id="navbarDropdown" role="button" data-bs-toggle="dropdown">
+                            {{ current_user.username }}
+                        </a>
+                        <ul class="dropdown-menu dropdown-menu-end">
+                            <li>
+                                <a class="dropdown-item" href="{{ url_for('auth.logout') }}">ログアウト</a>
+                            </li>
+                        </ul>
+                    </li>
+                    {% else %}
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('auth.login') }}">ログイン</a>
+                    </li>
+                    {% endif %}
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container mt-4">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+            <div class="alert alert-{{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endif %}
+        {% endwith %}
+        
+        {% block content %}{% endblock %}
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
+"""
+
+# app/templates/auth/login.html
+"""
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header text-center">
+                <h4>ログイン</h4>
+            </div>
+            <div class="card-body">
+                <form method="POST" action="">
+                    {{ form.hidden_tag() }}
+                    <div class="mb-3">
+                        {{ form.username.label(class="form-label") }}
+                        {{ form.username(class="form-control") }}
+                        {% for error in form.username.errors %}
+                        <div class="text-danger">{{ error }}</div>
+                        {% endfor %}
+                    </div>
+                    <div class="mb-3">
+                        {{ form.password.label(class="form-label") }}
+                        {{ form.password(class="form-control") }}
+                        {% for error in form.password.errors %}
+                        <div class="text-danger">{{ error }}</div>
+                        {% endfor %}
+                    </div>
+                    <div class="mb-3 form-check">
+                        {{ form.remember_me(class="form-check-input") }}
+                        {{ form.remember_me.label(class="form-check-label") }}
+                    </div>
+                    <div class="d-grid">
+                        {{ form.submit(class="btn btn-primary") }}
+                    </div>
+                </form>
+            </div>
+            <div class="card-footer text-center">
+                <small>アカウントをお持ちでない場合は <a href="{{ url_for('auth.register') }}">新規登録</a></small>
+                <br>
+                <small class="text-muted">* 初期管理者アカウント: admin / admin123</small>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+"""
+
+# app/templates/auth/register.html
+"""
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header text-center">
+                <h4>新規アカウント登録</h4>
+            </div>
+            <div class="card-body">
+                <form method="POST" action="">
+                    {{ form.hidden_tag() }}
+                    <div class="mb-3">
+                        {{ form.username.label(class="form-label") }}
+                        {{ form.username(class="form-control") }}
+                        {% for error in form.username.errors %}
+                        <div class="text-danger">{{ error }}</div>
+                        {% endfor %}
+                    </div>
+                    <div class="mb-3">
+                        {{ form.password.label(class="form-label") }}
+                        {{ form.password(class="form-control") }}
+                        {% for error in form.password.errors %}
+                        <div class="text-danger">{{ error }}</div>
+                        {% endfor %}
+                    </div>
+                    <div class="mb-3">
+                        {{ form.password2.label(class="form-label") }}
+                        {{ form.password2(class="form-control") }}
+                        {% for error in form.password2.errors %}
+                        <div class="text-danger">{{ error }}</div>
+                        {% endfor %}
+                    </div>
+                    <div class="d-grid">
+                        {{ form.submit(class="btn btn-primary") }}
+                    </div>
+                </form>
+            </div>
+            <div class="card-footer text-center">
+                <small>既にアカウントをお持ちの場合は <a href="{{ url_for('auth.login') }}">ログイン</a></small>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+"""
+
+# app/templates/main/index.html
+"""
+{% extends "base.html" %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1>マイ絵本ライブラリ</h1>
+    {% if current_user.is_admin %}
+    <a href="{{ url_for('admin.add_book') }}" class="btn btn-primary">
+        <i class="fas fa-plus"></i> 絵本を追加
+    </a>
+    {% endif %}
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-6">
+        <form method="GET" action="{{ url_for('main.index') }}" class="d-flex">
+            <input type="text" name="query" class="form-control me-2" placeholder="絵本のタイトルを検索..." value="{{ search_query }}">
+            <button type="submit" class="btn btn-outline-primary">検索</button>
+        </form>
+    </div>
+    <div class="col-md-6">
+        <div class="d-flex justify-content-md-end mt-3 mt-md-0">
+            <div class="btn-group">
+                <a href="{{ url_for('main.index') }}" class="btn btn-outline-primary {% if not selected_tag %}active{% endif %}">
+                    すべて
+                </a>
+                {% for tag in all_tags %}
+                <a href="{{ url_for('main.index', tag=tag) }}" class="btn btn-outline-primary {% if selected_tag == tag %}active{% endif %}">
+                    {{ tag }}
+                </a>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if books %}
+<div class="row row-cols-1 row-cols-sm-2 row-cols-md-3 row-cols-lg-4 g-4">
+    {% for book in books %}
+    <div class="col">
+        <div class="card h-100 book-card">
+            <a href="{{ url_for('main.book_detail', id=book.id) }}" class="text-decoration-none">
+                <img src="{{ url_for('static', filename=book.cover_path) }}" class="card-img-top book-cover" alt="{{ book.title }}">
+                <div class="card-body">
+                    <h5 class="card-title text-truncate">{{ book.title }}</h5>
+                    <div class="mt-2">
+                        {% for tag in book.tags %}
+                        <span class="badge bg-primary me-1">{{ tag }}</span>
+                        {% endfor %}
+                    </div>
+                </div>
+            </a>
+            <div class="card-footer bg-transparent">
+                <div class="d-grid">
+                    <a href="{{ url_for('main.read_book', id=book.id) }}" class="btn btn-sm btn-outline-primary">
+                        読む
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="text-center my-5">
+    <h3>絵本が見つかりません</h3>
+    <p class="text-muted">検索条件を変更するか、新しい絵本を追加してください。</p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block styles %}
+<style>
+    .book-card {
+        transition: transform 0.2s;
+    }
+    .book-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+    }
+    .book-cover {
+        height: 250px;
+        object-fit: cover;
+    }
+</style>
+{% endblock %}
+"""
+
+# app/templates/main/book_detail.html
+"""
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container">
+    <div class="row">
+        <div class="col-md-4 mb-4">
+            <img src="{{ url_for('static', filename=book.cover_path) }}" class="img-fluid rounded shadow" alt="{{ book.title }}">
+        </div>
+        <div class="col-md-8">
+            <h1>{{ book.title }}</h1>
+            
+            <div class="mb-3">
+                {% for tag in book.tags %}
+                <span class="badge bg-primary me-1">{{ tag }}</span>
+                {% endfor %}
+            </div>
+            
+            <div class="d-flex mb-4">
+                <a href="{{ url_for('main.read_book', id=book.id) }}" class="btn btn-primary me-2">
+                    読む
+                </a>
+                {% if book.last_read_page > 0 %}
+                <a href="{{ url_for('main.read_book', id=book.id) }}#page={{ book.last_read_page }}" class="btn btn-outline-primary">
+                    続きから ({{ book.last_read_page }} ページ)
+                </a>
+                {% endif %}
+            </div>
+            
+            {% if book.bookmarks %}
+            <div class="card mt-4">
+                <div class="card-header">
+                    <h5 class="mb-0">ブックマーク</h5>
+                </div>
+                <div class="list-group list-group-flush">
+                    {% for bookmark in book.bookmarks %}
+                    <a href="{{ url_for('main.read_book', id=book.id) }}#page={{ bookmark.page }}" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center">
+                        <div>
+                            <strong>{{ bookmark.page }} ページ</strong>
+                            {% if bookmark.note %}
+                            <p class="mb-0 text-muted">{{ bookmark.note }}</p>
+                            {% endif %}
+                        </div>
+                        <span class="text-muted small">{{ bookmark.created_at.strftime('%Y/%m/%d') }}</span>
+                    </a>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    
+    {% if current_user.is_admin %}
+    <div class="mt-5 pt-3 border-top">
+        <h4>管理アクション</h4>
+        <form action="{{ url_for('admin.delete_book', id=book.id) }}" method="POST" onsubmit="return confirm('この絵本を削除してもよろしいですか？この操作は元に戻せません。');">
+            <button type="submit" class="btn btn-danger">
+                <i class="fas fa-trash"></i> 絵本を削除
+            </button>
+        </form>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+"""
+
+# app/templates/main/read_book.html
+"""
+{% extends "base.html" %}
+
+{% block styles %}
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/pdfjs-viewer/3.11.174/pdf-viewer.min.css">
+<style>
+    body, html {
+        height: 100%;
+        overflow: hidden;
+    }
+    
+    .container-fluid {
+        max-width: 100%;
+        height: calc(100vh - 56px);
+        padding: 0;
+    }
+    
+    #pdfContainer {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        position: relative;
+    }
+    
+    #canvasContainer {
+        width: 100%;
+        height: 100%;
+        overflow: auto;
+        text-align: center;
+    }
+    
+    #pdfCanvas {
+        margin: 0 auto;
+        box-shadow: 0 0 10px rgba(0, 0, 0, 0.3);
+    }
+    
+    .pdf-controls {
+        position: fixed;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        background-color: rgba(255, 255, 255, 0.8);
+        padding: 10px 15px;
+        border-radius: 30px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+        z-index: 1000;
+        display: flex;
+        align-items: center;
+    }
+    
+    .bookmark-button {
+        position: fixed;
+        top: 80px;
+        right: 20px;
+        z-index: 1000;
+    }
+    
+    .bookmark-panel {
+        position: fixed;
+        top: 80px;
+        right: 20px;
+        width: 300px;
+        max-height: 80vh;
+        overflow-y: auto;
+        z-index: 1000;
+        background-color: white;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+        border-radius: 5px;
+        display: none;
+    }
+    
+    .page-info {
+        margin: 0 15px;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container-fluid">
+    <div id="pdfContainer">
+        <div id="canvasContainer">
+            <canvas id="pdfCanvas"></canvas>
+        </div>
+    </div>
+    
+    <button class="btn btn-light rounded-circle bookmark-button" id="toggleBookmark">
+        <i class="fas fa-bookmark"></i>
+    </button>
+    
+    <div class="bookmark-panel card" id="bookmarkPanel">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">ブックマーク</h5>
+            <button type="button" class="btn-close" id="closeBookmarkPanel"></button>
+        </div>
+        <div class="card-body">
+            <div id="bookmarkList" class="list-group list-group-flush">
+                <!-- Bookmarks will be loaded here -->
+            </div>
+            
+            <div class="mt-3">
+                <div class="d-flex mb-2 align-items-center">
+                    <h6 class="mb-0">現在のページ: <span id="currentPageBookmark"></span></h6>
+                    <div class="ms-auto" id="currentPageBookmarkStatus"></div>
+                </div>
+                
+                <div class="mb-2">
+                    <label for="bookmarkNote" class="form-label">メモ</label>
+                    <textarea class="form-control" id="bookmarkNote" rows="2"></textarea>
+                </div>
+                
+                <div class="d-flex">
+                    <button id="addBookmark" class="btn btn-primary btn-sm me-2">ブックマークを追加</button>
+                    <button id="removeBookmark" class="btn btn-outline-danger btn-sm">削除</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="pdf-controls">
+        <button class="btn btn-light" id="prevPage">
+            <i class="fas fa-chevron-left"></i>
+        </button>
+        <div class="page-info">
+            <span id="currentPage">0</span> / <span id="totalPages">0</span>
+        </div>
+        <button class="btn btn-light" id="nextPage">
+            <i class="fas fa-chevron-right"></i>
+        </button>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://kit.fontawesome.com/your-fontawesome-kit.js"></script>
+<script>
+    const pdfUrl = "{{ url_for('static', filename=book.pdf_path) }}";
+    const bookId = "{{ book.id }}";
+    let pdfDoc = null,
+        currentPage = 1,
+        totalPages = 0,
+        pageRendering = false,
+        pageNumPending = null,
+        scale = 1.5,
+        canvas = document.getElementById('pdfCanvas'),
+        ctx = canvas.getContext('2d'),
+        bookmarks = [];
+
+    // Initialize PDF.js
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+    function renderPage(num) {
+        pageRendering = true;
+        document.getElementById('currentPage').textContent = num;
+        document.getElementById('currentPageBookmark').textContent = num;
+        
+        pdfDoc.getPage(num).then(page => {
+            const viewport = page.getViewport({ scale });
+            canvas.height = viewport.height;
+            canvas.width = viewport.width;
+            
+            const renderContext = {
+                canvasContext: ctx,
+                viewport: viewport
+            };
+            
+            const renderTask = page.render(renderContext);
+            
+            renderTask.promise.then(() => {
+                pageRendering = false;
+                if (pageNumPending !== null) {
+                    renderPage(pageNumPending);
+                    pageNumPending = null;
+                }
+                
+                // Save last read page
+                fetch(`/api/book/${bookId}/last-page`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ page: num })
+                });
+                
+                // Update bookmark status for this page
+                updateBookmarkStatus(num);
+            });
+        });
+    }
+
+    function queueRenderPage(num) {
+        if (pageRendering) {
+            pageNumPending = num;
+        } else {
+            renderPage(num);
+        }
+    }
+
+    function onPrevPage() {
+        if (currentPage <= 1) return;
+        currentPage--;
+        queueRenderPage(currentPage);
+    }
+
+    function onNextPage() {
+        if (currentPage >= totalPages) return;
+        currentPage++;
+        queueRenderPage(currentPage);
+    }
+
+    // Load PDF and initial page
+    pdfjsLib.getDocument(pdfUrl).promise.then(pdf => {
+        pdfDoc = pdf;
+        totalPages = pdf.numPages;
+        document.getElementById('totalPages').textContent = totalPages;
+        
+        // Start at the last read page if available
+        const lastPage = {{ book.last_read_page }} || 1;
+        currentPage = lastPage;
+        
+        renderPage(currentPage);
+        loadBookmarks();
+    });
+
+    document.getElementById('prevPage').addEventListener('click', onPrevPage);
+    document.getElementById('nextPage').addEventListener('click', onNextPage);
+    
+    // Bookmark functionality
+    const toggleBookmarkBtn = document.getElementById('toggleBookmark');
+    const bookmarkPanel = document.getElementById('bookmarkPanel');
+    const closeBookmarkBtn = document.getElementById('closeBookmarkPanel');
+    const addBookmarkBtn = document.getElementById('addBookmark');
+    const removeBookmarkBtn = document.getElementById('removeBookmark');
+    const bookmarkNoteInput = document.getElementById('bookmarkNote');
+    const bookmarkStatusEl = document.getElementById('currentPageBookmarkStatus');
+    
+    toggleBookmarkBtn.addEventListener('click', () => {
+        if (bookmarkPanel.style.display === 'block') {
+            bookmarkPanel.style.display = 'none';
+        } else {
+            bookmarkPanel.style.display = 'block';
+            updateBookmarkStatus(currentPage);
+        }
+    });
+    
+    closeBookmarkBtn.addEventListener('click', () => {
+        bookmarkPanel.style.display = 'none';
+    });
+    
+    function loadBookmarks() {
+        fetch(`/api/book/${bookId}/bookmarks`)
+            .then(response => response.json())
+            .then(data => {
+                bookmarks = data;
+                renderBookmarkList();
+                updateBookmarkStatus(currentPage);
+            });
+    }
+    
+    function renderBookmarkList() {
+        const bookmarkList = document.getElementById('bookmarkList');
+        bookmarkList.innerHTML = '';
+        
+        if (bookmarks.length === 0) {
+            bookmarkList.innerHTML = '<div class="text-center text-muted py-3">ブックマークはありません</div>';
+            return;
+        }
+        
+        bookmarks.sort((a, b) => a.page - b.page);
+        
+        bookmarks.forEach(bookmark => {
+            const item = document.createElement('a');
+            item.href = '#';
+            item.className = 'list-group-item list-group-item-action';
+            item.innerHTML = `
+                <div class="d-flex w-100 justify-content-between">
+                    <h6 class="mb-1">ページ ${bookmark.page}</h6>
+                </div>
+                ${bookmark.note ? `<p class="mb-1 small text-muted">${bookmark.note}</p>` : ''}
+            `;
+            
+            item.addEventListener('click', (e) => {
+                e.preventDefault();
+                currentPage = bookmark.page;
+                queueRenderPage(currentPage);
+            });
+            
+            bookmarkList.appendChild(item);
+        });
+    }
+    
+    function updateBookmarkStatus(page) {
+        const bookmark = bookmarks.find(b => b.page === page);
+        
+        if (bookmark) {
+            bookmarkStatusEl.innerHTML = '<span class="badge bg-success">ブックマーク済み</span>';
+            bookmarkNoteInput.value = bookmark.note || '';
+            removeBookmarkBtn.disabled = false;
+            addBookmarkBtn.textContent = '更新';
+        } else {
+            bookmarkStatusEl.innerHTML = '';
+            bookmarkNoteInput.value = '';
+            removeBookmarkBtn.disabled = true;
+            addBookmarkBtn.textContent = 'ブックマークを追加';
+        }
+    }
+    
+    addBookmarkBtn.addEventListener('click', () => {
+        const note = bookmarkNoteInput.value.trim();
+        
+        fetch(`/api/book/${bookId}/bookmark`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                page: currentPage,
+                note: note
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                loadBookmarks();
+            }
+        });
+    });
+    
+    removeBookmarkBtn.addEventListener('click', () => {
+        fetch(`/api/book/${bookId}/bookmark`, {
+            method: 'DELETE',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                page: currentPage
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                loadBookmarks();
+            }
+        });
+    });
+    
+    // Keyboard navigation
+    document.addEventListener('keydown', (e) => {
+        if (e.code === 'ArrowLeft') {
+            onPrevPage();
+        } else if (e.code === 'ArrowRight') {
+            onNextPage();
+        }
+    });
+    
+    // Check for hash in URL to navigate to specific page
+    function checkHashForPage() {
+        const hash = window.location.hash;
+        if (hash.startsWith('#page=')) {
+            const page = parseInt(hash.split('=')[1]);
+            if (!isNaN(page) && page >= 1 && page <= totalPages) {
+                currentPage = page;
+                queueRenderPage(page);
+            }
+        }
+    }
+    
+    window.addEventListener('hashchange', checkHashForPage);
+    window.addEventListener('load', checkHashForPage);
+</script>
+{% endblock %}
+"""
+
+# app/templates/admin/index.html
+"""
+{% extends "base.html" %}
+
+{% block content %}
+<h1>管理パネル</h1>
+
+<div class="row mt-4">
+    <div class="col-md-6 mb-4">
+        <div class="card h-100">
+            <div class="card-body">
+                <h5 class="card-title">ユーザー管理</h5>
+                <p class="card-text">ユーザーの追加、編集、削除を行います。</p>
+                <a href="{{ url_for('admin.users') }}" class="btn btn-primary">ユーザー管理へ</a>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-6 mb-4">
+        <div class="card h-100">
+            <div class="card-body">
+                <h5 class="card-title">絵本管理</h5>
+                <p class="card-text">絵本の追加、編集、削除を行います。</p>
+                <a href="{{ url_for('admin.books') }}" class="btn btn-primary">絵本管理へ</a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+"""
+
+# app/templates/admin/users.html
+"""
+{% extends "base.html" %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1>ユーザー管理</h1>
+    <a href="{{ url_for('admin.add_user') }}" class="btn btn-primary">
+        <i class="fas fa-plus"></i> ユーザーを追加
+    </a>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-striped table-hover">
+                <thead>
+                    <tr>
+                        <th>ユーザー名</th>
+                        <th>権限</th>
+                        <th>作成日</th>
+                        <th>アクション</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for user in users %}
+                    <tr>
+                        <td>{{ user.username }}</td>
+                        <td>
+                            {% if user.is_admin %}
+                            <span class="badge bg-danger">管理者</span>
+                            {% else %}
+                            <span class="badge bg-secondary">一般ユーザー</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ user.created_at.strftime('%Y/%m/%d %H:%M') }}</td>
+                        <td>
+                            {% if user.id != current_user.id %}
+                            <form action="{{ url_for('admin.delete_user', id=user.id) }}" method="POST" class="d-inline" onsubmit="return confirm('このユーザーを削除してもよろしいですか？');">
+                                <button type="submit" class="btn btn-danger btn-sm">
+                                    <i class="fas fa-trash"></i> 削除
+                                </button>
+                            </form>
+                            {% else %}
+                            <span class="text-muted">自分自身</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+"""
+
+# app/templates/admin/add_user.html
+"""
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h4>ユーザーを追加</h4>
+            </div>
+            <div class="card-body">
+                <form method="POST" action="">
+                    {{ form.hidden_tag() }}
+                    <div class="mb-3">
+                        {{ form.username.label(class="form-label") }}
+                        {{ form.username(class="form-control") }}
+                        {% for error in form.username.errors %}
+                        <div class="text-danger">{{ error }}</div>
+                        {% endfor %}
+                    </div>
+                    <div class="mb-3">
+                        {{ form.password.label(class="form-label") }}
+                        {{ form.password(class="form-control") }}
+                        {% for error in form.password.errors %}
+                        <div class="text-danger">{{ error }}</div>
+                        {% endfor %}
+                    </div>
+                    <div class="mb-3">
+                        {{ form.password2.label(class="form-label") }}
+                        {{ form.password2(class="form-control") }}
+                        {% for error in form.password2.errors %}
+                        <div class="text-danger">{{ error }}</div>
+                        {% endfor %}
+                    </div>
+                    <div class="mb-3 form-check">
+                        {{ form.is_admin(class="form-check-input") }}
+                        {{ form.is_admin.label(class="form-check-label") }}
+                    </div>
+                    <div class="d-flex justify-content-between">
+                        <a href="{{ url_for('admin.users') }}" class="btn btn-secondary">キャンセル</a>
+                        {{ form.submit(class="btn btn-primary") }}
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+"""
+
+# app/templates/admin/books.html
+"""
+{% extends "base.html" %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1>絵本管理</h1>
+    <a href="{{ url_for('admin.add_book') }}" class="btn btn-primary">
+        <i class="fas fa-plus"></i> 絵本を追加
+    </a>
+</div>
+
+{% if books %}
+<div class="card">
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-striped table-hover">
+                <thead>
+                    <tr>
+                        <th style="width: 80px;">カバー</th>
+                        <th>タイトル</th>
+                        <th>タグ</th>
+                        <th>追加日</th>
+                        <th>最終閲覧</th>
+                        <th>アクション</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for book in books %}
+                    <tr>
+                        <td>
+                            <img src="{{ url_for('static', filename=book.cover_path) }}" alt="{{ book.title }}" class="img-thumbnail" width="60">
+                        </td>
+                        <td>{{ book.title }}</td>
+                        <td>
+                            {% for tag in book.tags %}
+                            <span class="badge bg-primary me-1">{{ tag }}</span>
+                            {% endfor %}
+                        </td>
+                        <td>{{ book.created_at.strftime('%Y/%m/%d') }}</td>
+                        <td>{{ book.updated_at.strftime('%Y/%m/%d') }}</td>
+                        <td>
+                            <a href="{{ url_for('main.book_detail', id=book.id) }}" class="btn btn-info btn-sm">
+                                <i class="fas fa-eye"></i> 詳細
+                            </a>
+                            <form action="{{ url_for('admin.delete_book', id=book.id) }}" method="POST" class="d-inline" onsubmit="return confirm('この絵本を削除してもよろしいですか？');">
+                                <button type="submit" class="btn btn-danger btn-sm">
+                                    <i class="fas fa-trash"></i> 削除
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% else %}
+<div class="text-center my-5">
+    <h3>絵本がありません</h3>
+    <p class="text-muted">「絵本を追加」ボタンから新しい絵本を追加してください。</p>
+</div>
+{% endif %}
+{% endblock %}
+"""
+
+# app/templates/admin/add_book.html
+"""
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h4>絵本を追加</h4>
+            </div>
+            <div class="card-body">
+                <form method="POST" action="" enctype="multipart/form-data">
+                    {{ form.hidden_tag() }}
+                    <div class="mb-3">
+                        {{ form.title.label(class="form-label") }}
+                        {{ form.title(class="form-control") }}
+                        {% for error in form.title.errors %}
+                        <div class="text-danger">{{ error }}</div>
+                        {% endfor %}
+                    </div>
+                    <div class="mb-3">
+                        {{ form.tags.label(class="form-label") }}
+                        {{ form.tags(class="form-control") }}
+                        <div class="form-text">カンマ区切りでタグを入力してください（例: 動物,冒険,3歳向け）</div>
+                    </div>
+                    <div class="mb-3">
+                        {{ form.pdf_file.label(class="form-label") }}
+                        {{ form.pdf_file(class="form-control") }}
+                        {% for error in form.pdf_file.errors %}
+                        <div class="text-danger">{{ error }}</div>
+                        {% endfor %}
+                    </div>
+                                        <div class="mb-3">
+                        {{ form.cover_file.label(class="form-label") }}
+                        {{ form.cover_file(class="form-control") }}
+                        <div class="form-text">カバー画像を指定しない場合、PDFの最初のページから自動生成されます。</div>
+                        {% for error in form.cover_file.errors %}
+                        <div class="text-danger">{{ error }}</div>
+                        {% endfor %}
+                    </div>
+                    <div class="d-flex justify-content-between">
+                        <a href="{{ url_for('admin.books') }}" class="btn btn-secondary">キャンセル</a>
+                        {{ form.submit(class="btn btn-primary") }}
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
 
