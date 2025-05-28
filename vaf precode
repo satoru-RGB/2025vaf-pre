@@ -1,21 +1,3 @@
-"""
-Picture Book Reader Web Application
------------------------------------
-
-This is a web-based application for reading and managing picture books in PDF format. 
-Features include user authentication, book management, reading progress tracking, and bookmarks.
-
-Project Structure:
-- app/ - Main application directory
-  - models.py - Database models
-  - routes.py - Web routes and controllers
-  - utils.py - Utility functions
-  - templates/ - HTML templates
-  - static/ - Static assets (CSS, JS)
-- config.py - Configuration settings
-- run.py - Application entry point
-"""
-
 # run.py - Application entry point
 from app import create_app
 
@@ -38,43 +20,67 @@ class Config:
     COVER_FOLDER = os.path.join(UPLOAD_FOLDER, 'covers')
     THUMBNAIL_SIZE = (400, 600)
     PERMANENT_SESSION_LIFETIME = timedelta(days=7)
+    LANGUAGES = ['ja', 'en', 'km']  # 対応言語: 日本語, 英語, クメール語 [cite: 2]
+    BABEL_DEFAULT_LOCALE = 'ja'     # デフォルト言語 [cite: 2, 3]
+    BABEL_DEFAULT_TIMEZONE = 'UTC'  # デフォルトタイムゾーン (必要に応じて変更) [cite: 3]
 
-# app/__init__.py - Application factory
+
+# app/__init__.py
+
 import os
-from flask import Flask
+from flask import Flask, request, g, session # request, g, session をインポート [cite: 3]
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager
 from flask_migrate import Migrate
+from flask_babel import Babel, gettext as _ # Babel と gettext (エイリアスとして _) をインポート [cite: 3]
 from config import Config
 
 db = SQLAlchemy()
 migrate = Migrate()
 login_manager = LoginManager()
 login_manager.login_view = 'auth.login'
-login_manager.login_message = 'このページにアクセスするにはログインが必要です。'
+# login_manager.login_message = 'このページにアクセスするにはログインが必要です。' # ← これはBabelで翻訳するため削除またはコメントアウト [cite: 3]
 login_manager.login_message_category = 'info'
+babel = Babel() # Babelオブジェクトを作成 [cite: 3]
 
 def create_app(config_class=Config):
     app = Flask(__name__)
     app.config.from_object(config_class)
 
-    # Ensure upload directories exist
     os.makedirs(app.config['PDF_FOLDER'], exist_ok=True)
     os.makedirs(app.config['COVER_FOLDER'], exist_ok=True)
 
     db.init_app(app)
-    migrate.init_app(app, db)
+    migrate.init_app(app, db) # [cite: 4]
     login_manager.init_app(app)
+    babel.init_app(app) # Babelをアプリに初期化 [cite: 4]
+
+
+    @babel.localeselector
+    def get_locale():
+        # ユーザーが言語を選択していればそれを使用 (セッション経由など、後のステップで実装) [cite: 4]
+        if 'language' in session and session['language'] in app.config['LANGUAGES']:
+            return session['language']
+        # それ以外の場合は、ブラウザの言語設定から最適なものを選択 [cite: 4]
+        return request.accept_languages.best_match(app.config['LANGUAGES'])
+
+    @app.before_request
+    def before_request():
+        # 選択されたロケールをグローバル変数 g に保存し、テンプレートで参照できるようにする [cite: 4, 5]
+        g.locale = str(get_locale())
+        # Flask-Loginのメッセージも翻訳対象にする [cite: 5]
+        login_manager.login_message = _('このページにアクセスするにはログインが必要です。')
+ 
 
     from app.main import bp as main_bp
     app.register_blueprint(main_bp)
-    
+
     from app.auth import bp as auth_bp
     app.register_blueprint(auth_bp, url_prefix='/auth')
-    
+
     from app.admin import bp as admin_bp
     app.register_blueprint(admin_bp, url_prefix='/admin')
-    
+
     return app
 
 # app/models.py - Database models
@@ -89,7 +95,7 @@ def load_user(id):
     return User.query.get(id)
 
 class User(UserMixin, db.Model):
-    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4())) # [cite: 6]
     username = db.Column(db.String(64), index=True, unique=True)
     password_hash = db.Column(db.String(128))
     is_admin = db.Column(db.Boolean, default=False)
@@ -105,7 +111,7 @@ class User(UserMixin, db.Model):
         return check_password_hash(self.password_hash, password)
 
 class BookTag(db.Model):
-    book_id = db.Column(db.String(36), db.ForeignKey('book.id'), primary_key=True)
+    book_id = db.Column(db.String(36), db.ForeignKey('book.id'), primary_key=True) # [cite: 7]
     tag = db.Column(db.String(50), primary_key=True)
 
 class Bookmark(db.Model):
@@ -123,7 +129,7 @@ class Book(db.Model):
     cover_path = db.Column(db.String(255), nullable=False)
     pdf_path = db.Column(db.String(255), nullable=False)
     last_read_page = db.Column(db.Integer, default=0)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow) # [cite: 8]
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     bookmarks = db.relationship('Bookmark', back_populates='book', cascade='all, delete-orphan')
@@ -137,7 +143,7 @@ class Book(db.Model):
             book_tag = BookTag(book_id=self.id, tag=tag)
             db.session.add(book_tag)
     
-    def remove_tag(self, tag):
+    def remove_tag(self, tag): # [cite: 9]
         BookTag.query.filter_by(book_id=self.id, tag=tag).delete()
     
     def add_bookmark(self, page, note=''):
@@ -154,13 +160,14 @@ class Book(db.Model):
 # app/auth/__init__.py - Auth blueprint
 from flask import Blueprint
 
-bp = Blueprint('auth', __name__)
+bp = Blueprint('auth', __name__) # [cite: 10]
 
 from app.auth import routes
 
 # app/auth/routes.py - Authentication routes
 from flask import render_template, flash, redirect, url_for, request
 from flask_login import login_user, logout_user, current_user
+from flask_babel import gettext as _
 from app import db
 from app.auth import bp
 from app.models import User
@@ -175,7 +182,7 @@ def login():
     if form.validate_on_submit():
         user = User.query.filter_by(username=form.username.data).first()
         if user is None or not user.check_password(form.password.data):
-            flash('ユーザー名またはパスワードが間違っています', 'danger')
+            flash(_('ユーザー名またはパスワードが間違っています'), 'danger') # [cite: 11]
             return redirect(url_for('auth.login'))
         
         login_user(user, remember=form.remember_me.data)
@@ -184,12 +191,12 @@ def login():
             next_page = url_for('main.index')
         return redirect(next_page)
     
-    return render_template('auth/login.html', title='ログイン', form=form)
+    return render_template('auth/login.html', title=_('ログイン'), form=form)
 
 @bp.route('/logout')
 def logout():
     logout_user()
-    return redirect(url_for('main.index'))
+    return redirect(url_for('main.index')) # [cite: 12]
 
 @bp.route('/register', methods=['GET', 'POST'])
 def register():
@@ -202,34 +209,35 @@ def register():
         user.set_password(form.password.data)
         db.session.add(user)
         db.session.commit()
-        flash('アカウントの登録が完了しました！', 'success')
+        flash(_('アカウントの登録が完了しました！'), 'success') # [cite: 12]
         return redirect(url_for('auth.login'))
     
-    return render_template('auth/register.html', title='新規登録', form=form)
+    return render_template('auth/register.html', title=_('新規登録'), form=form)
 
 # app/auth/forms.py - Authentication forms
 from flask_wtf import FlaskForm
 from wtforms import StringField, PasswordField, BooleanField, SubmitField
 from wtforms.validators import DataRequired, Length, EqualTo, ValidationError
+from flask_babel import lazy_gettext as _l # lazy_gettext for forms
 from app.models import User
 
 class LoginForm(FlaskForm):
-    username = StringField('ユーザー名', validators=[DataRequired()])
-    password = PasswordField('パスワード', validators=[DataRequired()])
-    remember_me = BooleanField('ログイン状態を保持')
-    submit = SubmitField('ログイン')
+    username = StringField(_l('ユーザー名'), validators=[DataRequired()]) # [cite: 13]
+    password = PasswordField(_l('パスワード'), validators=[DataRequired()]) # [cite: 13]
+    remember_me = BooleanField(_l('ログイン状態を保持')) # [cite: 13]
+    submit = SubmitField(_l('ログイン')) # [cite: 13]
 
 class RegistrationForm(FlaskForm):
-    username = StringField('ユーザー名', validators=[DataRequired(), Length(min=3, max=20)])
-    password = PasswordField('パスワード', validators=[DataRequired(), Length(min=6)])
+    username = StringField(_l('ユーザー名'), validators=[DataRequired(), Length(min=3, max=20)]) # [cite: 13]
+    password = PasswordField(_l('パスワード'), validators=[DataRequired(), Length(min=6)]) # [cite: 13]
     password2 = PasswordField(
-        'パスワード（確認用）', validators=[DataRequired(), EqualTo('password')])
-    submit = SubmitField('登録')
+        _l('パスワード（確認用）'), validators=[DataRequired(), EqualTo('password')]) # [cite: 13]
+    submit = SubmitField(_l('登録')) # [cite: 13]
     
     def validate_username(self, username):
-        user = User.query.filter_by(username=username.data).first()
+        user = User.query.filter_by(username=username.data).first() # [cite: 14]
         if user is not None:
-            raise ValidationError('このユーザー名は既に使用されています。別のユーザー名を選択してください。')
+            raise ValidationError(_l('このユーザー名は既に使用されています。別のユーザー名を選択してください。')) # [cite: 14]
 
 # app/main/__init__.py - Main blueprint
 from flask import Blueprint
@@ -239,11 +247,12 @@ bp = Blueprint('main', __name__)
 from app.main import routes
 
 # app/main/routes.py - Main routes
-from flask import render_template, flash, redirect, url_for, request, current_app, jsonify
+from flask import render_template, flash, redirect, url_for, request, current_app, jsonify, session
 from flask_login import login_required, current_user
+from flask_babel import gettext as _
 from app import db
 from app.main import bp
-from app.models import Book, Bookmark
+from app.models import Book, Bookmark, BookTag
 from app.main.forms import SearchForm
 
 @bp.route('/')
@@ -254,26 +263,26 @@ def index():
     selected_tag = request.args.get('tag')
     search_query = request.args.get('query', '')
     
-    # Get all available tags
-    tags = db.session.query(BookTag.tag).distinct().all()
-    all_tags = [tag[0] for tag in tags]
+    # Get all available tags [cite: 15]
+    tags_query = db.session.query(BookTag.tag).distinct().all()
+    all_tags = [tag[0] for tag in tags_query]
     
-    # Filter books by search query and tag
-    books = Book.query
+    # Filter books by search query and tag [cite: 15]
+    books_query = Book.query
     if search_query:
-        books = books.filter(Book.title.contains(search_query))
+        books_query = books_query.filter(Book.title.contains(search_query))
     
     if selected_tag:
-        book_ids = [bt.book_id for bt in BookTag.query.filter_by(tag=selected_tag).all()]
-        books = books.filter(Book.id.in_(book_ids))
+        book_ids_query = [bt.book_id for bt in BookTag.query.filter_by(tag=selected_tag).all()]
+        books_query = books_query.filter(Book.id.in_(book_ids_query))
     
-    books = books.all()
+    books = books_query.all() # [cite: 16]
     
     return render_template('main/index.html', 
-                          title='マイ絵本ライブラリ',
+                          title=_('マイ絵本ライブラリ'),
                           books=books, 
                           search_form=search_form,
-                          all_tags=all_tags,
+                          all_tags=all_tags, # [cite: 17]
                           selected_tag=selected_tag,
                           search_query=search_query)
 
@@ -287,9 +296,9 @@ def book_detail(id):
 @login_required
 def read_book(id):
     book = Book.query.get_or_404(id)
-    return render_template('main/read_book.html', title=f'読む: {book.title}', book=book)
+    return render_template('main/read_book.html', title=_('読む: {}').format(book.title), book=book)
 
-@bp.route('/api/book/<string:id>/last-page', methods=['POST'])
+@bp.route('/api/book/<string:id>/last-page', methods=['POST']) # [cite: 18]
 @login_required
 def update_last_page(id):
     book = Book.query.get_or_404(id)
@@ -307,7 +316,7 @@ def manage_bookmark(id):
         page = request.json.get('page', 0)
         note = request.json.get('note', '')
         
-        # Check if bookmark already exists
+        # Check if bookmark already exists [cite: 19]
         existing = book.get_bookmark(page)
         if existing:
             existing.note = note
@@ -319,7 +328,7 @@ def manage_bookmark(id):
     
     elif request.method == 'DELETE':
         page = request.json.get('page', 0)
-        book.remove_bookmark(page)
+        book.remove_bookmark(page) # [cite: 20]
         db.session.commit()
         return jsonify({'success': True})
 
@@ -330,14 +339,22 @@ def get_bookmarks(id):
     bookmarks = [{'page': b.page, 'note': b.note} for b in book.bookmarks]
     return jsonify(bookmarks)
 
+@bp.route('/set_language/<language>')
+def set_language(language=None):
+    if language in current_app.config['LANGUAGES']:
+        session['language'] = language
+    next_url = request.args.get('next') or url_for('main.index')
+    return redirect(next_url)
+
 # app/main/forms.py - Main forms
 from flask_wtf import FlaskForm
 from wtforms import StringField, SubmitField
 from wtforms.validators import DataRequired
+from flask_babel import lazy_gettext as _l
 
 class SearchForm(FlaskForm):
-    query = StringField('検索', validators=[DataRequired()])
-    submit = SubmitField('検索')
+    query = StringField(_l('検索'), validators=[DataRequired()])
+    submit = SubmitField(_l('検索'))
 
 # app/admin/__init__.py - Admin blueprint
 from flask import Blueprint
@@ -348,7 +365,8 @@ from app.admin import routes
 
 # app/admin/routes.py - Admin routes
 from flask import render_template, flash, redirect, url_for, request, current_app
-from flask_login import login_required, current_user
+from flask_login import login_required, current_user # [cite: 21]
+from flask_babel import gettext as _
 from app import db
 from app.admin import bp
 from app.models import User, Book, BookTag
@@ -360,22 +378,22 @@ def admin_required(f):
     @login_required
     def decorated_function(*args, **kwargs):
         if not current_user.is_admin:
-            flash('管理者権限が必要です', 'danger')
+            flash(_('管理者権限が必要です'), 'danger') # [cite: 21]
             return redirect(url_for('main.index'))
         return f(*args, **kwargs)
-    decorated_function.__name__ = f.__name__
+    decorated_function.__name__ = f.__name__ # to avoid overwriting endpoint name
     return decorated_function
 
 @bp.route('/')
 @admin_required
 def index():
-    return render_template('admin/index.html', title='管理パネル')
+    return render_template('admin/index.html', title=_('管理パネル'))
 
 @bp.route('/users')
 @admin_required
-def users():
-    users = User.query.all()
-    return render_template('admin/users.html', title='ユーザー管理', users=users)
+def users(): # [cite: 22]
+    users_list = User.query.all()
+    return render_template('admin/users.html', title=_('ユーザー管理'), users=users_list)
 
 @bp.route('/users/add', methods=['GET', 'POST'])
 @admin_required
@@ -386,27 +404,27 @@ def add_user():
         user.set_password(form.password.data)
         db.session.add(user)
         db.session.commit()
-        flash(f'ユーザー「{form.username.data}」を追加しました', 'success')
+        flash(_('ユーザー「{}」を追加しました').format(form.username.data), 'success') # [cite: 22]
         return redirect(url_for('admin.users'))
-    return render_template('admin/add_user.html', title='ユーザー追加', form=form)
+    return render_template('admin/add_user.html', title=_('ユーザー追加'), form=form)
 
 @bp.route('/users/<string:id>/delete', methods=['POST'])
 @admin_required
 def delete_user(id):
     user = User.query.get_or_404(id)
-    if user.id == current_user.id:
-        flash('自分自身を削除することはできません', 'danger')
+    if user.id == current_user.id: # [cite: 23]
+        flash(_('自分自身を削除することはできません'), 'danger') # [cite: 23]
     else:
         db.session.delete(user)
         db.session.commit()
-        flash(f'ユーザー「{user.username}」を削除しました', 'success')
+        flash(_('ユーザー「{}」を削除しました').format(user.username), 'success') # [cite: 23]
     return redirect(url_for('admin.users'))
 
 @bp.route('/books')
 @admin_required
 def books():
-    books = Book.query.all()
-    return render_template('admin/books.html', title='絵本管理', books=books)
+    books_list = Book.query.all()
+    return render_template('admin/books.html', title=_('絵本管理'), books=books_list)
 
 @bp.route('/books/add', methods=['GET', 'POST'])
 @admin_required
@@ -415,7 +433,7 @@ def add_book():
     if form.validate_on_submit():
         # Save PDF file
         pdf_filename = save_pdf(form.pdf_file.data)
-        pdf_path = os.path.join('uploads', 'pdf', pdf_filename)
+        pdf_path = os.path.join('uploads', 'pdf', pdf_filename) # [cite: 24]
         
         # Handle cover image
         if form.cover_file.data:
@@ -424,7 +442,7 @@ def add_book():
             # Generate cover from PDF
             cover_filename = generate_thumbnail(pdf_filename)
         
-        cover_path = os.path.join('uploads', 'covers', cover_filename)
+        cover_path = os.path.join('uploads', 'covers', cover_filename) # [cite: 25]
         
         # Create book
         book = Book(
@@ -433,20 +451,20 @@ def add_book():
             pdf_path=pdf_path
         )
         
-        # Add tags
-        tags = [tag.strip() for tag in form.tags.data.split(',') if tag.strip()]
+        # Add tags [cite: 26]
+        tags_list = [tag.strip() for tag in form.tags.data.split(',') if tag.strip()]
         
         db.session.add(book)
         db.session.flush()  # To get book.id
         
-        for tag in tags:
-            book.add_tag(tag)
+        for tag_item in tags_list:
+            book.add_tag(tag_item)
         
         db.session.commit()
-        flash(f'絵本「{form.title.data}」を追加しました', 'success')
-        return redirect(url_for('admin.books'))
+        flash(_('絵本「{}」を追加しました').format(form.title.data), 'success') # [cite: 26]
+        return redirect(url_for('admin.books')) # [cite: 27]
     
-    return render_template('admin/add_book.html', title='絵本追加', form=form)
+    return render_template('admin/add_book.html', title=_('絵本追加'), form=form)
 
 @bp.route('/books/<string:id>/delete', methods=['POST'])
 @admin_required
@@ -460,53 +478,54 @@ def delete_book(id):
         
         if os.path.exists(os.path.join(current_app.root_path, 'static', book.cover_path)):
             os.remove(os.path.join(current_app.root_path, 'static', book.cover_path))
-    except Exception as e:
-        flash(f'ファイル削除中にエラーが発生しました: {str(e)}', 'warning')
+    except Exception as e: # [cite: 28]
+        flash(_('ファイル削除中にエラーが発生しました: {}').format(str(e)), 'warning') # [cite: 28]
     
     # Delete from database
     db.session.delete(book)
     db.session.commit()
     
-    flash(f'絵本「{book.title}」を削除しました', 'success')
+    flash(_('絵本「{}」を削除しました').format(book.title), 'success') # [cite: 28]
     return redirect(url_for('admin.books'))
 
 # app/admin/forms.py - Admin forms
 from flask_wtf import FlaskForm
-from flask_wtf.file import FileField, FileRequired, FileAllowed
-from wtforms import StringField, PasswordField, BooleanField, SubmitField
+from flask_wtf.file import FileField, FileAllowed
+from wtforms import StringField, PasswordField, BooleanField, SubmitField # Removed FileRequired as it's used inline
 from wtforms.validators import DataRequired, Length, EqualTo, ValidationError
+from flask_babel import lazy_gettext as _l
 from app.models import User
 
 class AddUserForm(FlaskForm):
-    username = StringField('ユーザー名', validators=[DataRequired(), Length(min=3, max=20)])
-    password = PasswordField('パスワード', validators=[DataRequired(), Length(min=6)])
-    password2 = PasswordField(
-        'パスワード（確認用）', validators=[DataRequired(), EqualTo('password')])
-    is_admin = BooleanField('管理者権限')
-    submit = SubmitField('追加')
+    username = StringField(_l('ユーザー名'), validators=[DataRequired(), Length(min=3, max=20)])
+    password = PasswordField(_l('パスワード'), validators=[DataRequired(), Length(min=6)])
+    password2 = PasswordField( # [cite: 29]
+        _l('パスワード（確認用）'), validators=[DataRequired(), EqualTo('password')])
+    is_admin = BooleanField(_l('管理者権限')) # [cite: 29]
+    submit = SubmitField(_l('追加')) # [cite: 29]
     
     def validate_username(self, username):
         user = User.query.filter_by(username=username.data).first()
         if user is not None:
-            raise ValidationError('このユーザー名は既に使用されています。別のユーザー名を選択してください。')
+            raise ValidationError(_l('このユーザー名は既に使用されています。別のユーザー名を選択してください。')) # [cite: 29]
 
 class AddBookForm(FlaskForm):
-    title = StringField('タイトル', validators=[DataRequired(), Length(max=100)])
-    tags = StringField('タグ（カンマ区切り）')
-    pdf_file = FileField('PDFファイル', validators=[
-        FileRequired(),
-        FileAllowed(['pdf'], 'PDFファイルのみアップロード可能です')
+    title = StringField(_l('タイトル'), validators=[DataRequired(), Length(max=100)])
+    tags = StringField(_l('タグ（カンマ区切り）'))
+    pdf_file = FileField(_l('PDFファイル'), validators=[
+        DataRequired(message=_l('PDFファイルを選択してください。')), # Replaced FileRequired with DataRequired for consistency with message
+        FileAllowed(['pdf'], _l('PDFファイルのみアップロード可能です')) # [cite: 30]
     ])
-    cover_file = FileField('カバー画像（任意）', validators=[
-        FileAllowed(['jpg', 'jpeg', 'png'], '画像ファイルのみアップロード可能です')
+    cover_file = FileField(_l('カバー画像（任意）'), validators=[
+        FileAllowed(['jpg', 'jpeg', 'png'], _l('画像ファイルのみアップロード可能です')) # [cite: 30]
     ])
-    submit = SubmitField('追加')
+    submit = SubmitField(_l('追加'))
 
 # app/utils.py - Utility functions
 import os
 import uuid
 from flask import current_app
-from werkzeug.utils import secure_filename
+# from werkzeug.utils import secure_filename # Not used
 import fitz  # PyMuPDF
 from PIL import Image
 from io import BytesIO
@@ -519,7 +538,7 @@ def save_pdf(pdf_file):
 
 def save_cover(cover_file):
     """Save cover image with unique filename"""
-    extension = cover_file.filename.rsplit('.', 1)[1].lower()
+    extension = cover_file.filename.rsplit('.', 1)[1].lower() # [cite: 31]
     filename = f"{uuid.uuid4().hex}.{extension}"
     cover_file.save(os.path.join(current_app.config['COVER_FOLDER'], filename))
     return filename
@@ -536,7 +555,7 @@ def generate_thumbnail(pdf_filename):
     
     # Render page to image
     pix = first_page.get_pixmap()
-    img_data = pix.tobytes("jpeg")
+    img_data = pix.tobytes("jpeg") # [cite: 32]
     
     # Resize image
     img = Image.open(BytesIO(img_data))
@@ -555,7 +574,7 @@ def seed_admin():
     admin = User.query.filter_by(is_admin=True).first()
     if admin is None:
         admin = User(username='admin', is_admin=True)
-        admin.set_password('admin123')
+        admin.set_password('admin123') # [cite: 33]
         db.session.add(admin)
         db.session.commit()
         print("Admin user created: username='admin', password='admin123'")
@@ -568,75 +587,48 @@ def seed_sample_books():
     if Book.query.count() == 0:
         # Add sample books
         # This would require sample PDF files to be in place
-        pass
+        pass # [cite: 34]
 
-# Create templates directory structure and HTML templates
-"""
-app/templates/
-  └── base.html
-  ├── auth/
-  │   ├── login.html
-  │   └── register.html
-  ├── main/
-  │   ├── index.html 
-  │   ├── book_detail.html
-  │   └── read_book.html
-  └── admin/
-      ├── index.html
-      ├── users.html
-      ├── add_user.html
-      ├── books.html
-      └── add_book.html
-"""
+# --- HTML Templates ---
 
 # app/templates/base.html
 """
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="{{ g.locale if g.locale else config.BABEL_DEFAULT_LOCALE }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% if title %}{{ title }} - {% endif %}絵本リーダー</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <title>{% if title %}{{ _(title) }} - {% endif %}{{ _('絵本リーダー') }}</title> <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     {% block styles %}{% endblock %}
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
         <div class="container">
-            <a class="navbar-brand" href="{{ url_for('main.index') }}">絵本リーダー</a>
-            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
-                <span class="navbar-toggler-icon"></span>
+            <a class="navbar-brand" href="{{ url_for('main.index') }}">{{ _('絵本リーダー') }}</a> <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav"> <span class="navbar-toggler-icon"></span>
             </button>
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav me-auto">
                     {% if current_user.is_authenticated %}
                     <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('main.index') }}">ライブラリ</a>
-                    </li>
+                        <a class="nav-link" href="{{ url_for('main.index') }}">{{ _('ライブラリ') }}</a> </li>
                     {% if current_user.is_admin %}
                     <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('admin.index') }}">管理</a>
-                    </li>
+                        <a class="nav-link" href="{{ url_for('admin.index') }}">{{ _('管理') }}</a> </li>
                     {% endif %}
                     {% endif %}
                 </ul>
-                <ul class="navbar-nav">
-                    {% if current_user.is_authenticated %}
+                <ul class="navbar-nav"> {% if current_user.is_authenticated %}
                     <li class="nav-item dropdown">
-                        <a class="nav-link dropdown-toggle" href="#" id="navbarDropdown" role="button" data-bs-toggle="dropdown">
-                            {{ current_user.username }}
+                        <a class="nav-link dropdown-toggle" href="#" id="navbarDropdown" role="button" data-bs-toggle="dropdown"> {{ current_user.username }}
                         </a>
                         <ul class="dropdown-menu dropdown-menu-end">
                             <li>
-                                <a class="dropdown-item" href="{{ url_for('auth.logout') }}">ログアウト</a>
-                            </li>
-                        </ul>
-                    </li>
+                                <a class="dropdown-item" href="{{ url_for('auth.logout') }}">{{ _('ログアウト') }}</a> </li>
+                        </ul> </li>
                     {% else %}
                     <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('auth.login') }}">ログイン</a>
-                    </li>
+                        <a class="nav-link" href="{{ url_for('auth.login') }}">{{ _('ログイン') }}</a> </li>
                     {% endif %}
                 </ul>
             </div>
@@ -645,10 +637,8 @@ app/templates/
 
     <div class="container mt-4">
         {% with messages = get_flashed_messages(with_categories=true) %}
-        {% if messages %}
-            {% for category, message in messages %}
-            <div class="alert alert-{{ category }}">{{ message }}</div>
-            {% endfor %}
+        {% if messages %} {% for category, message in messages %}
+            <div class="alert alert-{{ category }}">{{ message }}</div> {% endfor %}
         {% endif %}
         {% endwith %}
         
@@ -656,8 +646,7 @@ app/templates/
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
-    {% block scripts %}{% endblock %}
-</body>
+    {% block scripts %}{% endblock %} </body>
 </html>
 """
 
@@ -670,38 +659,30 @@ app/templates/
     <div class="col-md-6">
         <div class="card">
             <div class="card-header text-center">
-                <h4>ログイン</h4>
+                <h4>{{ _('ログイン') }}</h4>
             </div>
             <div class="card-body">
-                <form method="POST" action="">
-                    {{ form.hidden_tag() }}
+                <form method="POST" action=""> {{ form.hidden_tag() }}
                     <div class="mb-3">
-                        {{ form.username.label(class="form-label") }}
-                        {{ form.username(class="form-control") }}
-                        {% for error in form.username.errors %}
-                        <div class="text-danger">{{ error }}</div>
+                        {{ form.username.label(class="form-label", text=_('ユーザー名')) }} {{ form.username(class="form-control") }}
+                        {% for error in form.username.errors %} <div class="text-danger">{{ error }}</div>
                         {% endfor %}
-                    </div>
-                    <div class="mb-3">
-                        {{ form.password.label(class="form-label") }}
+                    </div> <div class="mb-3">
+                        {{ form.password.label(class="form-label", text=_('パスワード')) }}
                         {{ form.password(class="form-control") }}
-                        {% for error in form.password.errors %}
-                        <div class="text-danger">{{ error }}</div>
+                        {% for error in form.password.errors %} <div class="text-danger">{{ error }}</div>
                         {% endfor %}
                     </div>
                     <div class="mb-3 form-check">
-                        {{ form.remember_me(class="form-check-input") }}
-                        {{ form.remember_me.label(class="form-check-label") }}
+                        {{ form.remember_me(class="form-check-input") }} {{ form.remember_me.label(class="form-check-label", text=_('ログイン状態を保持')) }}
                     </div>
                     <div class="d-grid">
-                        {{ form.submit(class="btn btn-primary") }}
-                    </div>
+                        {{ form.submit(class="btn btn-primary", value=_('ログイン')) }} </div>
                 </form>
             </div>
             <div class="card-footer text-center">
-                <small>アカウントをお持ちでない場合は <a href="{{ url_for('auth.register') }}">新規登録</a></small>
-                <br>
-                <small class="text-muted">* 初期管理者アカウント: admin / admin123</small>
+                <small>{{ _('アカウントをお持ちでない場合は') }} <a href="{{ url_for('auth.register') }}">{{ _('新規登録') }}</a></small> <br>
+                <small class="text-muted">{{ _('* 初期管理者アカウント: admin / admin123') }}</small>
             </div>
         </div>
     </div>
@@ -717,40 +698,32 @@ app/templates/
 <div class="row justify-content-center">
     <div class="col-md-6">
         <div class="card">
-            <div class="card-header text-center">
-                <h4>新規アカウント登録</h4>
+            <div class="card-header text-center"> <h4>{{ _('新規アカウント登録') }}</h4>
             </div>
             <div class="card-body">
                 <form method="POST" action="">
                     {{ form.hidden_tag() }}
-                    <div class="mb-3">
-                        {{ form.username.label(class="form-label") }}
+                    <div class="mb-3"> {{ form.username.label(class="form-label", text=_('ユーザー名')) }}
                         {{ form.username(class="form-control") }}
                         {% for error in form.username.errors %}
-                        <div class="text-danger">{{ error }}</div>
-                        {% endfor %}
+                        <div class="text-danger">{{ error }}</div> {% endfor %}
                     </div>
                     <div class="mb-3">
-                        {{ form.password.label(class="form-label") }}
-                        {{ form.password(class="form-control") }}
+                        {{ form.password.label(class="form-label", text=_('パスワード')) }} {{ form.password(class="form-control") }}
                         {% for error in form.password.errors %}
                         <div class="text-danger">{{ error }}</div>
-                        {% endfor %}
-                    </div>
+                        {% endfor %} </div>
                     <div class="mb-3">
-                        {{ form.password2.label(class="form-label") }}
-                        {{ form.password2(class="form-control") }}
-                        {% for error in form.password2.errors %}
+                        {{ form.password2.label(class="form-label", text=_('パスワード（確認用）')) }}
+                        {{ form.password2(class="form-control") }} {% for error in form.password2.errors %}
                         <div class="text-danger">{{ error }}</div>
                         {% endfor %}
-                    </div>
-                    <div class="d-grid">
-                        {{ form.submit(class="btn btn-primary") }}
+                    </div> <div class="d-grid">
+                        {{ form.submit(class="btn btn-primary", value=_('登録')) }}
                     </div>
                 </form>
-            </div>
-            <div class="card-footer text-center">
-                <small>既にアカウントをお持ちの場合は <a href="{{ url_for('auth.login') }}">ログイン</a></small>
+            </div> <div class="card-footer text-center">
+                <small>{{ _('既にアカウントをお持ちの場合は') }} <a href="{{ url_for('auth.login') }}">{{ _('ログイン') }}</a></small>
             </div>
         </div>
     </div>
@@ -764,35 +737,31 @@ app/templates/
 
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-4">
-    <h1>マイ絵本ライブラリ</h1>
+    <h1>{{ _('マイ絵本ライブラリ') }}</h1>
     {% if current_user.is_admin %}
     <a href="{{ url_for('admin.add_book') }}" class="btn btn-primary">
-        <i class="fas fa-plus"></i> 絵本を追加
-    </a>
+        <i class="fas fa-plus"></i> {{ _('絵本を追加') }} </a>
     {% endif %}
 </div>
 
 <div class="row mb-4">
     <div class="col-md-6">
         <form method="GET" action="{{ url_for('main.index') }}" class="d-flex">
-            <input type="text" name="query" class="form-control me-2" placeholder="絵本のタイトルを検索..." value="{{ search_query }}">
-            <button type="submit" class="btn btn-outline-primary">検索</button>
+            <input type="text" name="query" class="form-control me-2" placeholder="{{ _('絵本のタイトルを検索...') }}" value="{{ search_query }}">
+            <button type="submit" class="btn btn-outline-primary">{{ _('検索') }}</button>
         </form>
     </div>
     <div class="col-md-6">
         <div class="d-flex justify-content-md-end mt-3 mt-md-0">
-            <div class="btn-group">
-                <a href="{{ url_for('main.index') }}" class="btn btn-outline-primary {% if not selected_tag %}active{% endif %}">
-                    すべて
+            <div class="btn-group"> <a href="{{ url_for('main.index') }}" class="btn btn-outline-primary {% if not selected_tag %}active{% endif %}">
+                    {{ _('すべて') }}
                 </a>
                 {% for tag in all_tags %}
-                <a href="{{ url_for('main.index', tag=tag) }}" class="btn btn-outline-primary {% if selected_tag == tag %}active{% endif %}">
-                    {{ tag }}
+                <a href="{{ url_for('main.index', tag=tag) }}" class="btn btn-outline-primary {% if selected_tag == tag %}active{% endif %}"> {{ tag }}
                 </a>
                 {% endfor %}
             </div>
-        </div>
-    </div>
+        </div> </div>
 </div>
 
 {% if books %}
@@ -803,29 +772,25 @@ app/templates/
             <a href="{{ url_for('main.book_detail', id=book.id) }}" class="text-decoration-none">
                 <img src="{{ url_for('static', filename=book.cover_path) }}" class="card-img-top book-cover" alt="{{ book.title }}">
                 <div class="card-body">
-                    <h5 class="card-title text-truncate">{{ book.title }}</h5>
-                    <div class="mt-2">
+                    <h5 class="card-title text-truncate">{{ book.title }}</h5> <div class="mt-2">
                         {% for tag in book.tags %}
-                        <span class="badge bg-primary me-1">{{ tag }}</span>
-                        {% endfor %}
+                        <span class="badge bg-primary me-1">{{ tag }}</span> {% endfor %}
                     </div>
                 </div>
             </a>
             <div class="card-footer bg-transparent">
-                <div class="d-grid">
-                    <a href="{{ url_for('main.read_book', id=book.id) }}" class="btn btn-sm btn-outline-primary">
-                        読む
+                <div class="d-grid"> <a href="{{ url_for('main.read_book', id=book.id) }}" class="btn btn-sm btn-outline-primary">
+                        {{ _('読む') }}
                     </a>
                 </div>
-            </div>
-        </div>
+            </div> </div>
     </div>
     {% endfor %}
 </div>
 {% else %}
 <div class="text-center my-5">
-    <h3>絵本が見つかりません</h3>
-    <p class="text-muted">検索条件を変更するか、新しい絵本を追加してください。</p>
+    <h3>{{ _('絵本が見つかりません') }}</h3>
+    <p class="text-muted">{{ _('検索条件を変更するか、新しい絵本を追加してください。') }}</p>
 </div>
 {% endif %}
 {% endblock %}
@@ -833,15 +798,15 @@ app/templates/
 {% block styles %}
 <style>
     .book-card {
-        transition: transform 0.2s;
+        transition: transform 0.2s; /* [cite: 69] */
     }
     .book-card:hover {
-        transform: translateY(-5px);
-        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        transform: translateY(-5px); /* [cite: 70] */
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); /* [cite: 70] */
     }
     .book-cover {
-        height: 250px;
-        object-fit: cover;
+        height: 250px; /* [cite: 71] */
+        object-fit: cover; /* [cite: 71] */
     }
 </style>
 {% endblock %}
@@ -860,53 +825,44 @@ app/templates/
         <div class="col-md-8">
             <h1>{{ book.title }}</h1>
             
-            <div class="mb-3">
-                {% for tag in book.tags %}
+            <div class="mb-3"> {% for tag in book.tags %}
                 <span class="badge bg-primary me-1">{{ tag }}</span>
                 {% endfor %}
             </div>
             
-            <div class="d-flex mb-4">
-                <a href="{{ url_for('main.read_book', id=book.id) }}" class="btn btn-primary me-2">
-                    読む
+            <div class="d-flex mb-4"> <a href="{{ url_for('main.read_book', id=book.id) }}" class="btn btn-primary me-2">
+                    {{ _('読む') }}
                 </a>
                 {% if book.last_read_page > 0 %}
-                <a href="{{ url_for('main.read_book', id=book.id) }}#page={{ book.last_read_page }}" class="btn btn-outline-primary">
-                    続きから ({{ book.last_read_page }} ページ)
+                <a href="{{ url_for('main.read_book', id=book.id) }}#page={{ book.last_read_page }}" class="btn btn-outline-primary"> {{ _('続きから (%(page_num)s ページ)', page_num=book.last_read_page) }}
                 </a>
                 {% endif %}
             </div>
             
-            {% if book.bookmarks %}
-            <div class="card mt-4">
+            {% if book.bookmarks %} <div class="card mt-4">
                 <div class="card-header">
-                    <h5 class="mb-0">ブックマーク</h5>
+                    <h5 class="mb-0">{{ _('ブックマーク') }}</h5>
                 </div>
                 <div class="list-group list-group-flush">
-                    {% for bookmark in book.bookmarks %}
-                    <a href="{{ url_for('main.read_book', id=book.id) }}#page={{ bookmark.page }}" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center">
+                    {% for bookmark in book.bookmarks %} <a href="{{ url_for('main.read_book', id=book.id) }}#page={{ bookmark.page }}" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center">
                         <div>
-                            <strong>{{ bookmark.page }} ページ</strong>
-                            {% if bookmark.note %}
+                            <strong>{{ _('%(page_num)s ページ', page_num=bookmark.page) }}</strong> {% if bookmark.note %}
                             <p class="mb-0 text-muted">{{ bookmark.note }}</p>
                             {% endif %}
-                        </div>
-                        <span class="text-muted small">{{ bookmark.created_at.strftime('%Y/%m/%d') }}</span>
+                        </div> <span class="text-muted small">{{ bookmark.created_at.strftime('%Y/%m/%d') }}</span>
                     </a>
                     {% endfor %}
-                </div>
-            </div>
+                </div> </div>
             {% endif %}
         </div>
     </div>
     
     {% if current_user.is_admin %}
     <div class="mt-5 pt-3 border-top">
-        <h4>管理アクション</h4>
-        <form action="{{ url_for('admin.delete_book', id=book.id) }}" method="POST" onsubmit="return confirm('この絵本を削除してもよろしいですか？この操作は元に戻せません。');">
+        <h4>{{ _('管理アクション') }}</h4>
+        <form action="{{ url_for('admin.delete_book', id=book.id) }}" method="POST" onsubmit="return confirm('{{ _('この絵本を削除してもよろしいですか？この操作は元に戻せません。') }}');">
             <button type="submit" class="btn btn-danger">
-                <i class="fas fa-trash"></i> 絵本を削除
-            </button>
+                <i class="fas fa-trash"></i> {{ _('絵本を削除') }} </button>
         </form>
     </div>
     {% endif %}
@@ -922,72 +878,72 @@ app/templates/
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/pdfjs-viewer/3.11.174/pdf-viewer.min.css">
 <style>
     body, html {
-        height: 100%;
-        overflow: hidden;
+        height: 100%; /* [cite: 81] */
+        overflow: hidden; /* [cite: 81] */
     }
     
     .container-fluid {
-        max-width: 100%;
-        height: calc(100vh - 56px);
-        padding: 0;
+        max-width: 100%; /* [cite: 82] */
+        height: calc(100vh - 56px); /* [cite: 82] */
+        padding: 0; /* [cite: 82] */
     }
     
     #pdfContainer {
-        width: 100%;
-        height: 100%;
-        overflow: hidden;
-        position: relative;
+        width: 100%; /* [cite: 83] */
+        height: 100%; /* [cite: 83] */
+        overflow: hidden; /* [cite: 83] */
+        position: relative; /* [cite: 83] */
     }
     
     #canvasContainer {
-        width: 100%;
-        height: 100%;
-        overflow: auto;
-        text-align: center;
+        width: 100%; /* [cite: 84] */
+        height: 100%; /* [cite: 84] */
+        overflow: auto; /* [cite: 84] */
+        text-align: center; /* [cite: 84] */
     }
     
     #pdfCanvas {
-        margin: 0 auto;
-        box-shadow: 0 0 10px rgba(0, 0, 0, 0.3);
+        margin: 0 auto; /* [cite: 85] */
+        box-shadow: 0 0 10px rgba(0, 0, 0, 0.3); /* [cite: 85] */
     }
     
     .pdf-controls {
-        position: fixed;
-        bottom: 20px;
-        left: 50%;
-        transform: translateX(-50%);
-        background-color: rgba(255, 255, 255, 0.8);
-        padding: 10px 15px;
-        border-radius: 30px;
-        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
-        z-index: 1000;
-        display: flex;
-        align-items: center;
+        position: fixed; /* [cite: 86] */
+        bottom: 20px; /* [cite: 86] */
+        left: 50%; /* [cite: 86] */
+        transform: translateX(-50%); /* [cite: 86] */
+        background-color: rgba(255, 255, 255, 0.8); /* [cite: 86] */
+        padding: 10px 15px; /* [cite: 86] */
+        border-radius: 30px; /* [cite: 87] */
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2); /* [cite: 87] */
+        z-index: 1000; /* [cite: 87] */
+        display: flex; /* [cite: 87] */
+        align-items: center; /* [cite: 87] */
     }
     
     .bookmark-button {
-        position: fixed;
-        top: 80px;
-        right: 20px;
-        z-index: 1000;
+        position: fixed; /* [cite: 88] */
+        top: 80px; /* [cite: 89] */
+        right: 20px; /* [cite: 89] */
+        z-index: 1000; /* [cite: 89] */
     }
     
     .bookmark-panel {
-        position: fixed;
-        top: 80px;
-        right: 20px;
-        width: 300px;
-        max-height: 80vh;
-        overflow-y: auto;
-        z-index: 1000;
-        background-color: white;
-        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
-        border-radius: 5px;
-        display: none;
+        position: fixed; /* [cite: 89] */
+        top: 80px; /* [cite: 90] */
+        right: 20px; /* [cite: 90] */
+        width: 300px; /* [cite: 90] */
+        max-height: 80vh; /* [cite: 90] */
+        overflow-y: auto; /* [cite: 90] */
+        z-index: 1000; /* [cite: 90] */
+        background-color: white; /* [cite: 90] */
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2); /* [cite: 91] */
+        border-radius: 5px; /* [cite: 91] */
+        display: none; /* [cite: 91] */
     }
     
     .page-info {
-        margin: 0 15px;
+        margin: 0 15px; /* [cite: 93] */
     }
 </style>
 {% endblock %}
@@ -1000,59 +956,53 @@ app/templates/
         </div>
     </div>
     
-    <button class="btn btn-light rounded-circle bookmark-button" id="toggleBookmark">
+    <button class="btn btn-light rounded-circle bookmark-button" id="toggleBookmark" title="{{ _('ブックマークパネルを開閉') }}">
         <i class="fas fa-bookmark"></i>
     </button>
     
     <div class="bookmark-panel card" id="bookmarkPanel">
         <div class="card-header d-flex justify-content-between align-items-center">
-            <h5 class="mb-0">ブックマーク</h5>
-            <button type="button" class="btn-close" id="closeBookmarkPanel"></button>
+            <h5 class="mb-0">{{ _('ブックマーク') }}</h5> <button type="button" class="btn-close" id="closeBookmarkPanel" aria-label="{{ _('閉じる') }}"></button>
         </div>
         <div class="card-body">
             <div id="bookmarkList" class="list-group list-group-flush">
-                <!-- Bookmarks will be loaded here -->
-            </div>
+                </div>
             
-            <div class="mt-3">
-                <div class="d-flex mb-2 align-items-center">
-                    <h6 class="mb-0">現在のページ: <span id="currentPageBookmark"></span></h6>
+            <div class="mt-3"> <div class="d-flex mb-2 align-items-center">
+                    <h6 class="mb-0">{{ _('現在のページ') }}: <span id="currentPageBookmark"></span></h6>
                     <div class="ms-auto" id="currentPageBookmarkStatus"></div>
                 </div>
                 
-                <div class="mb-2">
-                    <label for="bookmarkNote" class="form-label">メモ</label>
+                <div class="mb-2"> <label for="bookmarkNote" class="form-label">{{ _('メモ') }}</label>
                     <textarea class="form-control" id="bookmarkNote" rows="2"></textarea>
                 </div>
                 
-                <div class="d-flex">
-                    <button id="addBookmark" class="btn btn-primary btn-sm me-2">ブックマークを追加</button>
-                    <button id="removeBookmark" class="btn btn-outline-danger btn-sm">削除</button>
+                <div class="d-flex"> <button id="addBookmark" class="btn btn-primary btn-sm me-2"
+                            data-text-add="{{ _('ブックマークを追加') }}"
+                            data-text-update="{{ _('更新') }}">{{ _('ブックマークを追加') }}</button>
+                    <button id="removeBookmark" class="btn btn-outline-danger btn-sm">{{ _('削除') }}</button>
                 </div>
             </div>
-        </div>
-    </div>
+        </div> </div>
     
     <div class="pdf-controls">
-        <button class="btn btn-light" id="prevPage">
+        <button class="btn btn-light" id="prevPage" title="{{ _('前のページ') }}">
             <i class="fas fa-chevron-left"></i>
         </button>
         <div class="page-info">
             <span id="currentPage">0</span> / <span id="totalPages">0</span>
         </div>
-        <button class="btn btn-light" id="nextPage">
-            <i class="fas fa-chevron-right"></i>
-        </button>
+        <button class="btn btn-light" id="nextPage" title="{{ _('次のページ') }}">
+            <i class="fas fa-chevron-right"></i> </button>
     </div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<script src="https://kit.fontawesome.com/your-fontawesome-kit.js"></script>
-<script>
-    const pdfUrl = "{{ url_for('static', filename=book.pdf_path) }}";
-    const bookId = "{{ book.id }}";
+<script src="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/js/all.min.js"></script> <script>
+    const pdfUrl = "{{ url_for('static', filename=book.pdf_path) }}"; /* [cite: 99] */
+    const bookId = "{{ book.id }}"; /* [cite: 100] */
     let pdfDoc = null,
         currentPage = 1,
         totalPages = 0,
@@ -1061,14 +1011,18 @@ app/templates/
         scale = 1.5,
         canvas = document.getElementById('pdfCanvas'),
         ctx = canvas.getContext('2d'),
-        bookmarks = [];
+        bookmarks = []; /* [cite: 100] */
 
-    // Initialize PDF.js
-    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    const translations = {
+        noBookmarks: "{{ _('ブックマークはありません') }}",
+        bookmarked: "{{ _('ブックマーク済み') }}"
+    };
+
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; /* [cite: 101] */
 
     function renderPage(num) {
-        pageRendering = true;
-        document.getElementById('currentPage').textContent = num;
+        pageRendering = true; /* [cite: 101] */
+        document.getElementById('currentPage').textContent = num; /* [cite: 102] */
         document.getElementById('currentPageBookmark').textContent = num;
         
         pdfDoc.getPage(num).then(page => {
@@ -1078,80 +1032,73 @@ app/templates/
             
             const renderContext = {
                 canvasContext: ctx,
-                viewport: viewport
+                viewport: viewport /* [cite: 103] */
             };
             
             const renderTask = page.render(renderContext);
             
             renderTask.promise.then(() => {
-                pageRendering = false;
+                pageRendering = false; /* [cite: 104] */
                 if (pageNumPending !== null) {
                     renderPage(pageNumPending);
                     pageNumPending = null;
                 }
                 
-                // Save last read page
-                fetch(`/api/book/${bookId}/last-page`, {
+                fetch(`/api/book/${bookId}/last-page`, { /* [cite: 105] */
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
-                    },
+                    }, /* [cite: 106] */
                     body: JSON.stringify({ page: num })
                 });
-                
-                // Update bookmark status for this page
-                updateBookmarkStatus(num);
-            });
+                updateBookmarkStatus(num); /* [cite: 107] */
+            }); /* [cite: 108] */
         });
     }
 
     function queueRenderPage(num) {
         if (pageRendering) {
-            pageNumPending = num;
+            pageNumPending = num; /* [cite: 109] */
         } else {
-            renderPage(num);
+            renderPage(num); /* [cite: 109] */
         }
     }
 
     function onPrevPage() {
-        if (currentPage <= 1) return;
-        currentPage--;
+        if (currentPage <= 1) return; /* [cite: 110] */
+        currentPage--; /* [cite: 111] */
         queueRenderPage(currentPage);
     }
 
     function onNextPage() {
-        if (currentPage >= totalPages) return;
-        currentPage++;
+        if (currentPage >= totalPages) return; /* [cite: 111] */
+        currentPage++; /* [cite: 112] */
         queueRenderPage(currentPage);
     }
 
-    // Load PDF and initial page
     pdfjsLib.getDocument(pdfUrl).promise.then(pdf => {
         pdfDoc = pdf;
         totalPages = pdf.numPages;
         document.getElementById('totalPages').textContent = totalPages;
         
-        // Start at the last read page if available
-        const lastPage = {{ book.last_read_page }} || 1;
+        const lastPage = {{ book.last_read_page or 1 }};
         currentPage = lastPage;
         
-        renderPage(currentPage);
+        renderPage(currentPage); /* [cite: 113] */
         loadBookmarks();
     });
-
-    document.getElementById('prevPage').addEventListener('click', onPrevPage);
+    document.getElementById('prevPage').addEventListener('click', onPrevPage); /* [cite: 114] */
     document.getElementById('nextPage').addEventListener('click', onNextPage);
     
-    // Bookmark functionality
     const toggleBookmarkBtn = document.getElementById('toggleBookmark');
-    const bookmarkPanel = document.getElementById('bookmarkPanel');
-    const closeBookmarkBtn = document.getElementById('closeBookmarkPanel');
+    const bookmarkPanel = document.getElementById('bookmarkPanel'); /* [cite: 114] */
+    const closeBookmarkBtn = document.getElementById('closeBookmarkPanel'); /* [cite: 115] */
     const addBookmarkBtn = document.getElementById('addBookmark');
     const removeBookmarkBtn = document.getElementById('removeBookmark');
     const bookmarkNoteInput = document.getElementById('bookmarkNote');
-    const bookmarkStatusEl = document.getElementById('currentPageBookmarkStatus');
-    
-    toggleBookmarkBtn.addEventListener('click', () => {
+    const bookmarkStatusEl = document.getElementById('currentPageBookmarkStatus'); /* [cite: 115] */
+
+    toggleBookmarkBtn.addEventListener('click', () => { /* [cite: 116] */
         if (bookmarkPanel.style.display === 'block') {
             bookmarkPanel.style.display = 'none';
         } else {
@@ -1159,66 +1106,61 @@ app/templates/
             updateBookmarkStatus(currentPage);
         }
     });
-    
-    closeBookmarkBtn.addEventListener('click', () => {
+    closeBookmarkBtn.addEventListener('click', () => { /* [cite: 117] */
         bookmarkPanel.style.display = 'none';
     });
-    
-    function loadBookmarks() {
+    function loadBookmarks() { /* [cite: 118] */
         fetch(`/api/book/${bookId}/bookmarks`)
             .then(response => response.json())
             .then(data => {
                 bookmarks = data;
                 renderBookmarkList();
                 updateBookmarkStatus(currentPage);
-            });
+            }); /* [cite: 119] */
     }
     
     function renderBookmarkList() {
-        const bookmarkList = document.getElementById('bookmarkList');
-        bookmarkList.innerHTML = '';
+        const bookmarkList = document.getElementById('bookmarkList'); /* [cite: 119] */
+        bookmarkList.innerHTML = ''; /* [cite: 120] */
         
         if (bookmarks.length === 0) {
-            bookmarkList.innerHTML = '<div class="text-center text-muted py-3">ブックマークはありません</div>';
-            return;
+            bookmarkList.innerHTML = `<div class="text-center text-muted py-3">${translations.noBookmarks}</div>`; /* [cite: 120] */
+            return; /* [cite: 121] */
         }
         
-        bookmarks.sort((a, b) => a.page - b.page);
-        
-        bookmarks.forEach(bookmark => {
+        bookmarks.sort((a, b) => a.page - b.page); /* [cite: 121] */
+        bookmarks.forEach(bookmark => { /* [cite: 122] */
             const item = document.createElement('a');
             item.href = '#';
             item.className = 'list-group-item list-group-item-action';
             item.innerHTML = `
                 <div class="d-flex w-100 justify-content-between">
-                    <h6 class="mb-1">ページ ${bookmark.page}</h6>
-                </div>
+                    <h6 class="mb-1">{{ _('ページ %(page_num)s', page_num='${bookmark.page}') }}</h6> </div>
                 ${bookmark.note ? `<p class="mb-1 small text-muted">${bookmark.note}</p>` : ''}
             `;
             
             item.addEventListener('click', (e) => {
                 e.preventDefault();
-                currentPage = bookmark.page;
+                currentPage = bookmark.page; /* [cite: 124] */
                 queueRenderPage(currentPage);
             });
             
             bookmarkList.appendChild(item);
-        });
+        }); /* [cite: 125] */
     }
     
     function updateBookmarkStatus(page) {
-        const bookmark = bookmarks.find(b => b.page === page);
-        
-        if (bookmark) {
-            bookmarkStatusEl.innerHTML = '<span class="badge bg-success">ブックマーク済み</span>';
-            bookmarkNoteInput.value = bookmark.note || '';
+        const bookmark = bookmarks.find(b => b.page === page); /* [cite: 125] */
+        if (bookmark) { /* [cite: 126] */
+            bookmarkStatusEl.innerHTML = `<span class="badge bg-success">${translations.bookmarked}</span>`; /* [cite: 126] */
+            bookmarkNoteInput.value = bookmark.note || ''; /* [cite: 127] */
             removeBookmarkBtn.disabled = false;
-            addBookmarkBtn.textContent = '更新';
+            addBookmarkBtn.textContent = addBookmarkBtn.dataset.textUpdate; /* [cite: 127] */
         } else {
-            bookmarkStatusEl.innerHTML = '';
-            bookmarkNoteInput.value = '';
-            removeBookmarkBtn.disabled = true;
-            addBookmarkBtn.textContent = 'ブックマークを追加';
+            bookmarkStatusEl.innerHTML = ''; /* [cite: 128] */
+            bookmarkNoteInput.value = ''; /* [cite: 128] */
+            removeBookmarkBtn.disabled = true; /* [cite: 129] */
+            addBookmarkBtn.textContent = addBookmarkBtn.dataset.textAdd; /* [cite: 129] */
         }
     }
     
@@ -1229,7 +1171,7 @@ app/templates/
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-            },
+            }, /* [cite: 130] */
             body: JSON.stringify({
                 page: currentPage,
                 note: note
@@ -1237,13 +1179,12 @@ app/templates/
         })
         .then(response => response.json())
         .then(data => {
-            if (data.success) {
+            if (data.success) { /* [cite: 131] */
                 loadBookmarks();
             }
         });
     });
-    
-    removeBookmarkBtn.addEventListener('click', () => {
+    removeBookmarkBtn.addEventListener('click', () => { /* [cite: 132] */
         fetch(`/api/book/${bookId}/bookmark`, {
             method: 'DELETE',
             headers: {
@@ -1251,7 +1192,7 @@ app/templates/
             },
             body: JSON.stringify({
                 page: currentPage
-            })
+            }) /* [cite: 133] */
         })
         .then(response => response.json())
         .then(data => {
@@ -1260,30 +1201,26 @@ app/templates/
             }
         });
     });
-    
-    // Keyboard navigation
-    document.addEventListener('keydown', (e) => {
+    document.addEventListener('keydown', (e) => { /* [cite: 134] */
         if (e.code === 'ArrowLeft') {
             onPrevPage();
         } else if (e.code === 'ArrowRight') {
             onNextPage();
         }
     });
-    
-    // Check for hash in URL to navigate to specific page
-    function checkHashForPage() {
-        const hash = window.location.hash;
-        if (hash.startsWith('#page=')) {
-            const page = parseInt(hash.split('=')[1]);
-            if (!isNaN(page) && page >= 1 && page <= totalPages) {
-                currentPage = page;
-                queueRenderPage(page);
+    function checkHashForPage() { /* [cite: 135] */
+        const hash = window.location.hash; /* [cite: 135] */
+        if (hash.startsWith('#page=')) { /* [cite: 136] */
+            const page = parseInt(hash.split('=')[1]); /* [cite: 136] */
+            if (!isNaN(page) && page >= 1 && page <= totalPages) { /* [cite: 137] */
+                currentPage = page; /* [cite: 137] */
+                queueRenderPage(page); /* [cite: 138] */
             }
         }
     }
     
-    window.addEventListener('hashchange', checkHashForPage);
-    window.addEventListener('load', checkHashForPage);
+    window.addEventListener('hashchange', checkHashForPage); /* [cite: 139] */
+    window.addEventListener('load', checkHashForPage); /* [cite: 139] */
 </script>
 {% endblock %}
 """
@@ -1293,26 +1230,24 @@ app/templates/
 {% extends "base.html" %}
 
 {% block content %}
-<h1>管理パネル</h1>
+<h1>{{ _('管理パネル') }}</h1>
 
 <div class="row mt-4">
     <div class="col-md-6 mb-4">
         <div class="card h-100">
             <div class="card-body">
-                <h5 class="card-title">ユーザー管理</h5>
-                <p class="card-text">ユーザーの追加、編集、削除を行います。</p>
-                <a href="{{ url_for('admin.users') }}" class="btn btn-primary">ユーザー管理へ</a>
-            </div>
-        </div>
+                <h5 class="card-title">{{ _('ユーザー管理') }}</h5>
+                <p class="card-text">{{ _('ユーザーの追加、編集、削除を行います。') }}</p>
+                <a href="{{ url_for('admin.users') }}" class="btn btn-primary">{{ _('ユーザー管理へ') }}</a>
+            </div> </div>
     </div>
     
     <div class="col-md-6 mb-4">
         <div class="card h-100">
             <div class="card-body">
-                <h5 class="card-title">絵本管理</h5>
-                <p class="card-text">絵本の追加、編集、削除を行います。</p>
-                <a href="{{ url_for('admin.books') }}" class="btn btn-primary">絵本管理へ</a>
-            </div>
+                <h5 class="card-title">{{ _('絵本管理') }}</h5>
+                <p class="card-text">{{ _('絵本の追加、編集、削除を行います。') }}</p>
+                <a href="{{ url_for('admin.books') }}" class="btn btn-primary">{{ _('絵本管理へ') }}</a> </div>
         </div>
     </div>
 </div>
@@ -1325,53 +1260,42 @@ app/templates/
 
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-4">
-    <h1>ユーザー管理</h1>
+    <h1>{{ _('ユーザー管理') }}</h1>
     <a href="{{ url_for('admin.add_user') }}" class="btn btn-primary">
-        <i class="fas fa-plus"></i> ユーザーを追加
+        <i class="fas fa-plus"></i> {{ _('ユーザーを追加') }}
     </a>
 </div>
 
 <div class="card">
     <div class="card-body">
         <div class="table-responsive">
-            <table class="table table-striped table-hover">
-                <thead>
+            <table class="table table-striped table-hover"> <thead>
                     <tr>
-                        <th>ユーザー名</th>
-                        <th>権限</th>
-                        <th>作成日</th>
-                        <th>アクション</th>
+                        <th>{{ _('ユーザー名') }}</th>
+                        <th>{{ _('権限') }}</th>
+                        <th>{{ _('作成日') }}</th> <th>{{ _('アクション') }}</th>
                     </tr>
                 </thead>
                 <tbody>
-                    {% for user in users %}
-                    <tr>
+                    {% for user in users %} <tr>
                         <td>{{ user.username }}</td>
                         <td>
-                            {% if user.is_admin %}
-                            <span class="badge bg-danger">管理者</span>
+                            {% if user.is_admin %} <span class="badge bg-danger">{{ _('管理者') }}</span>
                             {% else %}
-                            <span class="badge bg-secondary">一般ユーザー</span>
-                            {% endif %}
+                            <span class="badge bg-secondary">{{ _('一般ユーザー') }}</span> {% endif %}
                         </td>
                         <td>{{ user.created_at.strftime('%Y/%m/%d %H:%M') }}</td>
-                        <td>
-                            {% if user.id != current_user.id %}
-                            <form action="{{ url_for('admin.delete_user', id=user.id) }}" method="POST" class="d-inline" onsubmit="return confirm('このユーザーを削除してもよろしいですか？');">
-                                <button type="submit" class="btn btn-danger btn-sm">
-                                    <i class="fas fa-trash"></i> 削除
+                        <td> {% if user.id != current_user.id %}
+                            <form action="{{ url_for('admin.delete_user', id=user.id) }}" method="POST" class="d-inline" onsubmit="return confirm('{{ _('このユーザーを削除してもよろしいですか？') }}');"> <button type="submit" class="btn btn-danger btn-sm"> <i class="fas fa-trash"></i> {{ _('削除') }}
                                 </button>
-                            </form>
-                            {% else %}
-                            <span class="text-muted">自分自身</span>
-                            {% endif %}
-                        </td>
+                            </form> {% else %}
+                            <span class="text-muted">{{ _('自分自身') }}</span>
+                            {% endif %} </td>
                     </tr>
                     {% endfor %}
                 </tbody>
             </table>
-        </div>
-    </div>
+        </div> </div>
 </div>
 {% endblock %}
 """
@@ -1385,40 +1309,32 @@ app/templates/
     <div class="col-md-8">
         <div class="card">
             <div class="card-header">
-                <h4>ユーザーを追加</h4>
+                <h4>{{ _('ユーザーを追加') }}</h4>
             </div>
             <div class="card-body">
-                <form method="POST" action="">
-                    {{ form.hidden_tag() }}
+                <form method="POST" action=""> {{ form.hidden_tag() }}
                     <div class="mb-3">
-                        {{ form.username.label(class="form-label") }}
-                        {{ form.username(class="form-control") }}
-                        {% for error in form.username.errors %}
+                        {{ form.username.label(class="form-label", text=_('ユーザー名')) }}
+                        {{ form.username(class="form-control") }} {% for error in form.username.errors %}
                         <div class="text-danger">{{ error }}</div>
                         {% endfor %}
-                    </div>
-                    <div class="mb-3">
-                        {{ form.password.label(class="form-label") }}
+                    </div> <div class="mb-3">
+                        {{ form.password.label(class="form-label", text=_('パスワード')) }}
                         {{ form.password(class="form-control") }}
-                        {% for error in form.password.errors %}
-                        <div class="text-danger">{{ error }}</div>
+                        {% for error in form.password.errors %} <div class="text-danger">{{ error }}</div>
                         {% endfor %}
                     </div>
                     <div class="mb-3">
-                        {{ form.password2.label(class="form-label") }}
-                        {{ form.password2(class="form-control") }}
+                        {{ form.password2.label(class="form-label", text=_('パスワード（確認用）')) }} {{ form.password2(class="form-control") }}
                         {% for error in form.password2.errors %}
-                        <div class="text-danger">{{ error }}</div>
-                        {% endfor %}
+                        <div class="text-danger">{{ error }}</div> {% endfor %}
                     </div>
                     <div class="mb-3 form-check">
-                        {{ form.is_admin(class="form-check-input") }}
-                        {{ form.is_admin.label(class="form-check-label") }}
+                        {{ form.is_admin(class="form-check-input") }} {{ form.is_admin.label(class="form-check-label", text=_('管理者権限')) }}
                     </div>
                     <div class="d-flex justify-content-between">
-                        <a href="{{ url_for('admin.users') }}" class="btn btn-secondary">キャンセル</a>
-                        {{ form.submit(class="btn btn-primary") }}
-                    </div>
+                        <a href="{{ url_for('admin.users') }}" class="btn btn-secondary">{{ _('キャンセル') }}</a>
+                        {{ form.submit(class="btn btn-primary", value=_('追加')) }} </div>
                 </form>
             </div>
         </div>
@@ -1433,9 +1349,8 @@ app/templates/
 
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-4">
-    <h1>絵本管理</h1>
-    <a href="{{ url_for('admin.add_book') }}" class="btn btn-primary">
-        <i class="fas fa-plus"></i> 絵本を追加
+    <h1>{{ _('絵本管理') }}</h1> <a href="{{ url_for('admin.add_book') }}" class="btn btn-primary">
+        <i class="fas fa-plus"></i> {{ _('絵本を追加') }}
     </a>
 </div>
 
@@ -1446,49 +1361,39 @@ app/templates/
             <table class="table table-striped table-hover">
                 <thead>
                     <tr>
-                        <th style="width: 80px;">カバー</th>
-                        <th>タイトル</th>
-                        <th>タグ</th>
-                        <th>追加日</th>
-                        <th>最終閲覧</th>
-                        <th>アクション</th>
+                        <th style="width: 80px;">{{ _('カバー') }}</th> <th>{{ _('タイトル') }}</th>
+                        <th>{{ _('タグ') }}</th>
+                        <th>{{ _('追加日') }}</th>
+                        <th>{{ _('最終更新日') }}</th> <th>{{ _('アクション') }}</th>
                     </tr>
                 </thead>
                 <tbody>
-                    {% for book in books %}
-                    <tr>
+                    {% for book in books %} <tr>
                         <td>
                             <img src="{{ url_for('static', filename=book.cover_path) }}" alt="{{ book.title }}" class="img-thumbnail" width="60">
-                        </td>
-                        <td>{{ book.title }}</td>
+                        </td> <td>{{ book.title }}</td>
                         <td>
-                            {% for tag in book.tags %}
-                            <span class="badge bg-primary me-1">{{ tag }}</span>
+                            {% for tag in book.tags %} <span class="badge bg-primary me-1">{{ tag }}</span>
                             {% endfor %}
                         </td>
-                        <td>{{ book.created_at.strftime('%Y/%m/%d') }}</td>
-                        <td>{{ book.updated_at.strftime('%Y/%m/%d') }}</td>
+                        <td>{{ book.created_at.strftime('%Y/%m/%d') }}</td> <td>{{ book.updated_at.strftime('%Y/%m/%d') }}</td>
                         <td>
-                            <a href="{{ url_for('main.book_detail', id=book.id) }}" class="btn btn-info btn-sm">
-                                <i class="fas fa-eye"></i> 詳細
+                            <a href="{{ url_for('main.book_detail', id=book.id) }}" class="btn btn-info btn-sm"> <i class="fas fa-eye"></i> {{ _('詳細') }}
                             </a>
-                            <form action="{{ url_for('admin.delete_book', id=book.id) }}" method="POST" class="d-inline" onsubmit="return confirm('この絵本を削除してもよろしいですか？');">
-                                <button type="submit" class="btn btn-danger btn-sm">
-                                    <i class="fas fa-trash"></i> 削除
-                                </button>
-                            </form>
+                            <form action="{{ url_for('admin.delete_book', id=book.id) }}" method="POST" class="d-inline" onsubmit="return confirm('{{ _('この絵本を削除してもよろしいですか？') }}');"> <button type="submit" class="btn btn-danger btn-sm">
+                                    <i class="fas fa-trash"></i> {{ _('削除') }}
+                                </button> </form>
                         </td>
                     </tr>
-                    {% endfor %}
-                </tbody>
+                    {% endfor %} </tbody>
             </table>
         </div>
     </div>
 </div>
 {% else %}
 <div class="text-center my-5">
-    <h3>絵本がありません</h3>
-    <p class="text-muted">「絵本を追加」ボタンから新しい絵本を追加してください。</p>
+    <h3>{{ _('絵本がありません') }}</h3>
+    <p class="text-muted">{{ _('「絵本を追加」ボタンから新しい絵本を追加してください。') }}</p>
 </div>
 {% endif %}
 {% endblock %}
@@ -1503,46 +1408,37 @@ app/templates/
     <div class="col-md-8">
         <div class="card">
             <div class="card-header">
-                <h4>絵本を追加</h4>
-            </div>
+                <h4>{{ _('絵本を追加') }}</h4> </div>
             <div class="card-body">
                 <form method="POST" action="" enctype="multipart/form-data">
                     {{ form.hidden_tag() }}
                     <div class="mb-3">
-                        {{ form.title.label(class="form-label") }}
-                        {{ form.title(class="form-control") }}
+                        {{ form.title.label(class="form-label", text=_('タイトル')) }} {{ form.title(class="form-control") }}
                         {% for error in form.title.errors %}
-                        <div class="text-danger">{{ error }}</div>
-                        {% endfor %}
+                        <div class="text-danger">{{ error }}</div> {% endfor %}
                     </div>
                     <div class="mb-3">
-                        {{ form.tags.label(class="form-label") }}
-                        {{ form.tags(class="form-control") }}
-                        <div class="form-text">カンマ区切りでタグを入力してください（例: 動物,冒険,3歳向け）</div>
-                    </div>
+                        {{ form.tags.label(class="form-label", text=_('タグ（カンマ区切り）')) }} {{ form.tags(class="form-control") }}
+                        <div class="form-text">{{ _('カンマ区切りでタグを入力してください（例: 動物,冒険,3歳向け）') }}</div> </div>
                     <div class="mb-3">
-                        {{ form.pdf_file.label(class="form-label") }}
-                        {{ form.pdf_file(class="form-control") }}
+                        {{ form.pdf_file.label(class="form-label", text=_('PDFファイル')) }} {{ form.pdf_file(class="form-control") }}
                         {% for error in form.pdf_file.errors %}
-                        <div class="text-danger">{{ error }}</div>
-                        {% endfor %}
+                        <div class="text-danger">{{ error }}</div> {% endfor %}
                     </div>
-                                        <div class="mb-3">
-                        {{ form.cover_file.label(class="form-label") }}
-                        {{ form.cover_file(class="form-control") }}
-                        <div class="form-text">カバー画像を指定しない場合、PDFの最初のページから自動生成されます。</div>
+                    <div class="mb-3">
+                        {{ form.cover_file.label(class="form-label", text=_('カバー画像（任意）')) }} {{ form.cover_file(class="form-control") }}
+                        <div class="form-text">{{ _('カバー画像を指定しない場合、PDFの最初のページから自動生成されます。') }}</div>
                         {% for error in form.cover_file.errors %}
-                        <div class="text-danger">{{ error }}</div>
-                        {% endfor %}
+                        <div class="text-danger">{{ error }}</div> {% endfor %}
                     </div>
                     <div class="d-flex justify-content-between">
-                        <a href="{{ url_for('admin.books') }}" class="btn btn-secondary">キャンセル</a>
-                        {{ form.submit(class="btn btn-primary") }}
+                        <a href="{{ url_for('admin.books') }}" class="btn btn-secondary">{{ _('キャンセル') }}</a> {{ form.submit(class="btn btn-primary", value=_('追加')) }}
                     </div>
                 </form>
             </div>
-        </div>
-    </div>
+        </div> </div>
 </div>
 {% endblock %}
+"""
+
 
